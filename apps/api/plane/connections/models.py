@@ -1,3 +1,7 @@
+# Copyright (c) 2023-present Plane Software, Inc. and contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+# See the LICENSE file for details.
+
 """Workspace credential / connection / entity-connection models.
 
 Schema mirrors the shape Plane Commercial's silo service expects on the

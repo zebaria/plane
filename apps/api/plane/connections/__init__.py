@@ -1,3 +1,7 @@
+# Copyright (c) 2023-present Plane Software, Inc. and contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+# See the LICENSE file for details.
+
 # Zebaria fork: workspace credentials/connections used by the silo
 # integrations service. Restores the data model that Plane Commercial
 # carries (workspace_credentials / workspace_connections /

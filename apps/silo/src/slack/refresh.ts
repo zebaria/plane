@@ -52,33 +52,40 @@ export const refreshBotToken = async (teamId: string): Promise<string | null> =>
   if (existing) return existing;
 
   const p = (async (): Promise<string | null> => {
-    const ctx = await resolveTeamContext(teamId);
-    if (!ctx?.refreshToken) {
-      console.warn(`[silo] no refresh_token for team=${teamId}; cannot rotate`);
+    try {
+      const ctx = await resolveTeamContext(teamId);
+      if (!ctx?.refreshToken) {
+        console.warn(`[silo] no refresh_token for team=${teamId}; cannot rotate`);
+        return null;
+      }
+
+      const r = await callSlackRefresh(ctx.refreshToken);
+      if (!r.ok || !r.access_token) {
+        console.error(`[silo] Slack refresh failed: ${r.error ?? "unknown"} (team=${teamId})`);
+        return null;
+      }
+
+      const persist = await callDjango("POST", "/api/v1/silo/slack/persist-tokens/", {
+        team_id: teamId,
+        access_token: r.access_token,
+        refresh_token: r.refresh_token ?? "",
+        expires_in: r.expires_in ?? null,
+      });
+      if (persist.status >= 300) {
+        console.error(`[silo] persist-tokens failed: ${persist.status} ${JSON.stringify(persist.data)}`);
+        // Token is good even if we couldn't store it; caller can retry
+        // this request, but the next will re-refresh. Better to fail.
+        return null;
+      }
+
+      invalidateTeamContext(teamId);
+      return r.access_token;
+    } catch (err) {
+      // Network/DNS/etc. — return null so callers see the original
+      // Slack error path rather than a refresh exception masking it.
+      console.error(`[silo] token refresh threw for team=${teamId}:`, err);
       return null;
     }
-
-    const r = await callSlackRefresh(ctx.refreshToken);
-    if (!r.ok || !r.access_token) {
-      console.error(`[silo] Slack refresh failed: ${r.error ?? "unknown"} (team=${teamId})`);
-      return null;
-    }
-
-    const persist = await callDjango("POST", "/api/v1/silo/slack/persist-tokens/", {
-      team_id: teamId,
-      access_token: r.access_token,
-      refresh_token: r.refresh_token ?? "",
-      expires_in: r.expires_in ?? null,
-    });
-    if (persist.status >= 300) {
-      console.error(`[silo] persist-tokens failed: ${persist.status} ${JSON.stringify(persist.data)}`);
-      // Token is good even if we couldn't store it; caller can retry
-      // this request, but the next will re-refresh. Better to fail.
-      return null;
-    }
-
-    invalidateTeamContext(teamId);
-    return r.access_token;
   })();
 
   inFlight.set(teamId, p);

@@ -224,17 +224,23 @@ const dispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void>
   const eligibleMappings = mappings.filter(
     (m) => (m.config?.events ?? []).length === 0 || (m.config?.events ?? []).includes(event.event_type)
   );
+  // Per-channel try/catch so a network/DNS hiccup on one mapping
+  // doesn't cancel the rest of the fan-out.
   await Promise.all(
     eligibleMappings.map(async (m) => {
-      const result = await callSlackApiForTeam("chat.postMessage", m.connection_team_id, {
-        channel: m.entity_id,
-        blocks,
-        text: fallbackText,
-        unfurl_links: false,
-        unfurl_media: false,
-      });
-      if (!result || !result.ok) {
-        console.error(`[silo] chat.postMessage to ${m.entity_id} failed: ${result?.error ?? "no-team-context"}`);
+      try {
+        const result = await callSlackApiForTeam("chat.postMessage", m.connection_team_id, {
+          channel: m.entity_id,
+          blocks,
+          text: fallbackText,
+          unfurl_links: false,
+          unfurl_media: false,
+        });
+        if (!result || !result.ok) {
+          console.error(`[silo] chat.postMessage to ${m.entity_id} failed: ${result?.error ?? "no-team-context"}`);
+        }
+      } catch (err) {
+        console.error(`[silo] chat.postMessage to ${m.entity_id} threw:`, err);
       }
     })
   );
@@ -251,30 +257,34 @@ const dispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void>
     // bucket between users on chat.postMessage.
     await Promise.all(
       event.dm_targets.map(async (dm) => {
-        console.log(`[silo] DM attempt slack_user=${dm.slack_user_id}`);
-        const opened = await callSlackApiForTeam<{
-          ok: boolean;
-          error?: string;
-          channel?: { id: string };
-        }>("conversations.open", dmTeamId, { users: dm.slack_user_id });
-        if (!opened || !opened.ok || !opened.channel?.id) {
-          console.error(
-            `[silo] conversations.open for ${dm.slack_user_id} failed: ${opened?.error ?? "no-team-context"}`
-          );
-          return;
-        }
-        console.log(`[silo] DM channel opened: ${opened.channel.id}`);
-        const r = await callSlackApiForTeam("chat.postMessage", dmTeamId, {
-          channel: opened.channel.id,
-          blocks,
-          text: fallbackText,
-          unfurl_links: false,
-          unfurl_media: false,
-        });
-        if (!r || !r.ok) {
-          console.error(`[silo] DM postMessage to ${dm.slack_user_id} failed: ${r?.error ?? "no-team-context"}`);
-        } else {
-          console.log(`[silo] DM postMessage to ${dm.slack_user_id} ok`);
+        try {
+          console.log(`[silo] DM attempt slack_user=${dm.slack_user_id}`);
+          const opened = await callSlackApiForTeam<{
+            ok: boolean;
+            error?: string;
+            channel?: { id: string };
+          }>("conversations.open", dmTeamId, { users: dm.slack_user_id });
+          if (!opened || !opened.ok || !opened.channel?.id) {
+            console.error(
+              `[silo] conversations.open for ${dm.slack_user_id} failed: ${opened?.error ?? "no-team-context"}`
+            );
+            return;
+          }
+          console.log(`[silo] DM channel opened: ${opened.channel.id}`);
+          const r = await callSlackApiForTeam("chat.postMessage", dmTeamId, {
+            channel: opened.channel.id,
+            blocks,
+            text: fallbackText,
+            unfurl_links: false,
+            unfurl_media: false,
+          });
+          if (!r || !r.ok) {
+            console.error(`[silo] DM postMessage to ${dm.slack_user_id} failed: ${r?.error ?? "no-team-context"}`);
+          } else {
+            console.log(`[silo] DM postMessage to ${dm.slack_user_id} ok`);
+          }
+        } catch (err) {
+          console.error(`[silo] DM to ${dm.slack_user_id} threw:`, err);
         }
       })
     );

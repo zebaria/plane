@@ -1,3 +1,7 @@
+# Copyright (c) 2023-present Plane Software, Inc. and contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+# See the LICENSE file for details.
+
 """HMAC authentication for the silo↔Django channel.
 
 Silo signs every request with a shared secret (`SILO_HMAC_SECRET_KEY`).

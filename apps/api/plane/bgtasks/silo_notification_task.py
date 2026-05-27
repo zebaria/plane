@@ -1,3 +1,7 @@
+# Copyright (c) 2023-present Plane Software, Inc. and contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+# See the LICENSE file for details.
+
 """Outbound dispatch from Plane → silo for project-scoped notifications.
 
 When a work item changes (created, state changed, comment added, etc.),
@@ -7,11 +11,11 @@ the project (`type=slack-channel-notification`) and, if any are
 configured for this event type, posts a single payload to silo via
 the silo↔Django HMAC channel.
 
-Silo handles all Slack formatting + delivery; Django stays out of
+Silo handles all Slack formatting and delivery; Django stays out of
 the Block Kit business.
 
 The HMAC scheme matches what silo uses to call Django, just in the
-reverse direction. Same shared secret, same algorithm. silo's events
+reverse direction. Same shared secret, same algorithm. Silo's events
 endpoint validates it.
 """
 
@@ -73,7 +77,7 @@ def _sign(method: str, path_with_silo_base: str, body: str) -> tuple[str, str]:
     return ts, sig
 
 
-def _render_comment_for_slack(comment: IssueComment, workspace_id: str) -> str:
+def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -> str:
     """Convert a Plane comment's HTML into Slack-mrkdwn-friendly text.
 
     Plane stores comments as HTML with `<mention-component>` tags
@@ -84,6 +88,9 @@ def _render_comment_for_slack(comment: IssueComment, workspace_id: str) -> str:
     linked their Slack identity, or `@DisplayName` as a fallback.
     """
     from bs4 import BeautifulSoup
+
+    if comment is None:
+        return ""
 
     html = comment.comment_html or ""
     if "mention-component" not in html:
@@ -123,7 +130,8 @@ def _render_comment_for_slack(comment: IssueComment, workspace_id: str) -> str:
         else:
             tag.replace_with(f"@{name_by_plane.get(str(plane_uid), 'user')}")
 
-    return soup.get_text(separator="").strip()
+    # noinspection PyArgumentList
+    return soup.get_text(separator="\n").strip()
 
 
 @shared_task
@@ -138,7 +146,7 @@ def dispatch_silo_work_item_event(
     """Build the silo payload for an activity and POST it.
 
     No-ops if the workspace has no Slack notification mappings for
-    this project — cheap fast path so this can be called on every
+    this project. Fast path so this can be called on every
     activity without measurable cost.
     """
     try:
@@ -146,7 +154,19 @@ def dispatch_silo_work_item_event(
         if not event_type:
             return
 
-        # Cheap existence check: is anything bound for this project?
+        # Parse the activity payload blobs once; both the state-change
+        # narrowing and the DM-target derivation read from them.
+        try:
+            req = json.loads(requested_data) if isinstance(requested_data, str) else (requested_data or {})
+            ci = json.loads(current_instance) if isinstance(current_instance, str) else (current_instance or {})
+        except (json.JSONDecodeError, TypeError):
+            req, ci = {}, {}
+        if not isinstance(req, dict):
+            req = {}
+        if not isinstance(ci, dict):
+            ci = {}
+
+        # Existence check: is anything bound for this project?
         mappings_qs = WorkspaceEntityConnection.objects.filter(
             project_id=project_id, type=SLACK_NOTIFICATION_TYPE
         )
@@ -155,7 +175,7 @@ def dispatch_silo_work_item_event(
 
         try:
             project = Project.objects.select_related("workspace").get(pk=project_id)
-        except Project.DoesNotExist:
+        except Project.DoesNotExist:  # noinspection PyUnresolvedReferences # noqa
             return
 
         issue = None
@@ -176,12 +196,12 @@ def dispatch_silo_work_item_event(
                 if not blob:
                     continue
                 try:
-                    ci = json.loads(blob) if isinstance(blob, str) else blob
+                    comment_payload = json.loads(blob) if isinstance(blob, str) else blob
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if not isinstance(ci, dict):
+                if not isinstance(comment_payload, dict):
                     continue
-                comment_id = ci.get("id")
+                comment_id = comment_payload.get("id")
                 if comment_id:
                     comment = IssueComment.objects.filter(pk=comment_id).first()
                     if comment:
@@ -195,12 +215,6 @@ def dispatch_silo_work_item_event(
         prev_state = None
         new_state = None
         if event_type == "work_item.updated":
-            try:
-                req = json.loads(requested_data) if isinstance(requested_data, str) else (requested_data or {})
-                ci = json.loads(current_instance) if isinstance(current_instance, str) else (current_instance or {})
-            except (json.JSONDecodeError, TypeError):
-                req, ci = {}, {}
-
             new_state_id = req.get("state_id") or req.get("state")
             prev_state_id = ci.get("state_id") or ci.get("state")
             if not new_state_id or not prev_state_id or new_state_id == prev_state_id:
@@ -216,7 +230,7 @@ def dispatch_silo_work_item_event(
             prev_state = states.get(str(prev_state_id))
 
             # Promote to `work_item.completed` if the new state's group
-            # is completed/cancelled — channels often subscribe to one
+            # is completed/canceled — channels often subscribe to one
             # but not the other, so the more specific event lets them
             # filter cleanly.
             if new_state and new_state.group in ("completed", "cancelled"):
@@ -229,7 +243,7 @@ def dispatch_silo_work_item_event(
             actor = User.objects.filter(pk=actor_id).first()
 
         # Per-user DM targets:
-        #   - newly-assigned users (issue.activity.updated where
+        #   - newly assigned users (issue.activity.updated where
         #     assignee_ids changed, OR issue.activity.created when the
         #     creator picked assignees up front)
         #   - users @-mentioned in the description (created/updated)
@@ -238,12 +252,6 @@ def dispatch_silo_work_item_event(
         # We exclude the actor — Slack DMing yourself when you assign
         # yourself or mention yourself in a comment is just noise.
         affected_plane_user_ids: set[str] = set()
-
-        try:
-            req = json.loads(requested_data) if isinstance(requested_data, str) else (requested_data or {})
-            ci = json.loads(current_instance) if isinstance(current_instance, str) else (current_instance or {})
-        except (json.JSONDecodeError, TypeError):
-            req, ci = {}, {}
 
         if event_type in ("work_item.created", "work_item.state_changed", "work_item.completed"):
             new_assignees = set(req.get("assignee_ids") or req.get("assignees") or [])
@@ -279,7 +287,7 @@ def dispatch_silo_work_item_event(
                 deleted_at__isnull=True,
             ).select_related("user")
             for m in mappings:
-                # Honour each user's DM toggle. v1: opt-IN — only DM if
+                # Honor each user's DM toggle. v1: opt-IN — only DM if
                 # the user explicitly enabled it in Profile → Connections.
                 cfg = m.config or {}
                 if not cfg.get("dm_on_assign", True) and event_type != "work_item.commented":
@@ -361,6 +369,6 @@ def dispatch_silo_work_item_event(
                 )
         except requests.RequestException as e:
             log.warning("silo notification post failed: %s", e)
-    except Exception:
+    except Exception as e:
         # Never let this kill the surrounding activity flow.
-        log.exception("dispatch_silo_work_item_event crashed")
+        log.exception(f"dispatch_silo_work_item_event crashed {e}")
