@@ -258,6 +258,10 @@ def dispatch_silo_work_item_event(
                     continue
                 comment_id = comment_payload.get("id")
                 if comment_id:
+                    try:
+                        uuid.UUID(str(comment_id))
+                    except ValueError:
+                        continue
                     comment = IssueComment.objects.filter(pk=comment_id).first()
                     if comment:
                         break
@@ -365,12 +369,19 @@ def dispatch_silo_work_item_event(
 
         dm_targets = []
         if affected_plane_user_ids:
+            valid_user_ids: list[str] = []
+            for uid in affected_plane_user_ids:
+                try:
+                    uuid.UUID(str(uid))
+                    valid_user_ids.append(str(uid))
+                except ValueError:
+                    continue
             mappings = WorkspaceUserConnection.objects.filter(
                 workspace_id=project.workspace_id,
                 connection_type="slack",
-                user_id__in=affected_plane_user_ids,
+                user_id__in=valid_user_ids,
                 deleted_at__isnull=True,
-            ).select_related("user")
+            ).select_related("user") if valid_user_ids else []
             for m in mappings:
                 # Honor each user's DM toggle. v1: opt-IN — only DM if
                 # the user explicitly enabled it in Profile → Connections.
