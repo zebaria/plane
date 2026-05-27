@@ -23,22 +23,27 @@ const bootstrap = async (): Promise<void> => {
 
 const app = createApp();
 
-const server = app.listen(config.port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`[silo] listening on :${config.port} basePath=${config.basePath}`);
-});
+// Don't bind the port until secrets have loaded — otherwise an early
+// Slack webhook can hit getSlackConfig() before SSM responds and throw.
+bootstrap()
+  .then(() => {
+    const server = app.listen(config.port, () => {
+      // eslint-disable-next-line no-console
+      console.log(`[silo] listening on :${config.port} basePath=${config.basePath}`);
+    });
 
-bootstrap().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error(`[silo] bootstrap failed: ${(err as Error).message}`);
-  process.exit(1);
-});
+    const shutdown = (signal: string) => {
+      // eslint-disable-next-line no-console
+      console.log(`[silo] received ${signal}, shutting down`);
+      server.close(() => process.exit(0));
+    };
 
-const shutdown = (signal: string) => {
-  // eslint-disable-next-line no-console
-  console.log(`[silo] received ${signal}, shutting down`);
-  server.close(() => process.exit(0));
-};
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    return server;
+  })
+  .catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[silo] bootstrap failed: ${(err as Error).message}`);
+    process.exit(1);
+  });

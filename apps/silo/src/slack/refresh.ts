@@ -65,16 +65,38 @@ export const refreshBotToken = async (teamId: string): Promise<string | null> =>
         return null;
       }
 
-      const persist = await callDjango("POST", "/api/v1/silo/slack/persist-tokens/", {
-        team_id: teamId,
-        access_token: r.access_token,
-        refresh_token: r.refresh_token ?? "",
-        expires_in: r.expires_in ?? null,
-      });
-      if (persist.status >= 300) {
-        console.error(`[silo] persist-tokens failed: ${persist.status} ${JSON.stringify(persist.data)}`);
-        // Token is good even if we couldn't store it; caller can retry
-        // this request, but the next will re-refresh. Better to fail.
+      // Slack invalidates the OLD refresh_token the moment we successfully
+      // call oauth.v2.access with grant_type=refresh_token, and the NEW
+      // refresh_token only lives in `r.refresh_token`. If we drop it on
+      // the floor (transient Django/DB hiccup), the workspace is locked
+      // out until an admin re-installs. Retry persistence with backoff
+      // before giving up.
+      let persist;
+      let lastErr = "";
+      // Sequential by design: each attempt depends on the previous one's
+      // response, and the backoff sleep is intentional.
+      // eslint-disable-next-line no-await-in-loop
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        persist = await callDjango("POST", "/api/v1/silo/slack/persist-tokens/", {
+          team_id: teamId,
+          access_token: r.access_token,
+          refresh_token: r.refresh_token ?? "",
+          expires_in: r.expires_in ?? null,
+        });
+        if (persist.status < 300) break;
+        lastErr = `${persist.status} ${JSON.stringify(persist.data)}`;
+        if (persist.status >= 400 && persist.status < 500 && persist.status !== 429) break;
+        if (attempt < 4) {
+          const backoffMs = 200 * 2 ** attempt;
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        }
+      }
+      if (!persist || persist.status >= 300) {
+        console.error(
+          `[silo] persist-tokens failed after retries: ${lastErr} — refresh_token may be lost; team=${teamId}`
+        );
         return null;
       }
 

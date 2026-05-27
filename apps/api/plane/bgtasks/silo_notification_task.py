@@ -191,13 +191,16 @@ def dispatch_silo_work_item_event(
         if not event_type:
             return
 
-        # Parse the activity payload blobs once; both the state-change
-        # narrowing and the DM-target derivation read from them.
+        # Parse the activity payload blobs independently — a malformed
+        # current_instance shouldn't discard a perfectly good requested_data.
         try:
             req = json.loads(requested_data) if isinstance(requested_data, str) else (requested_data or {})
+        except (json.JSONDecodeError, TypeError):
+            req = {}
+        try:
             ci = json.loads(current_instance) if isinstance(current_instance, str) else (current_instance or {})
         except (json.JSONDecodeError, TypeError):
-            req, ci = {}, {}
+            ci = {}
         if not isinstance(req, dict):
             req = {}
         if not isinstance(ci, dict):
@@ -297,11 +300,25 @@ def dispatch_silo_work_item_event(
         affected_plane_user_ids: set[str] = set()
 
         if event_type in ("work_item.created", "work_item.state_changed", "work_item.completed"):
-            new_assignees = set(req.get("assignee_ids") or req.get("assignees") or [])
-            old_assignees = set(ci.get("assignee_ids") or ci.get("assignees") or [])
-            added_assignees = new_assignees - old_assignees
-            for uid in added_assignees:
-                affected_plane_user_ids.add(str(uid))
+            # Plane activity payloads sometimes serialize assignees as
+            # full dicts (e.g. `{"id": "...", "email": "..."}`) rather
+            # than bare UUIDs — set() of dicts raises TypeError.
+            def _assignee_ids(d: dict) -> set[str]:
+                vals = d.get("assignee_ids") or d.get("assignees") or []
+                out: set[str] = set()
+                for v in vals:
+                    if isinstance(v, dict):
+                        uid = v.get("id")
+                        if uid:
+                            out.add(str(uid))
+                    elif v:
+                        out.add(str(v))
+                return out
+
+            new_assignees = _assignee_ids(req)
+            old_assignees = _assignee_ids(ci)
+            for uid in new_assignees - old_assignees:
+                affected_plane_user_ids.add(uid)
 
             html = req.get("description_html")
             if html:

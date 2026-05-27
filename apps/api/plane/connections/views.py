@@ -123,42 +123,69 @@ class SiloSlackInstallEndpoint(BaseAPIView):
             except (ValueError, TypeError):
                 pass
 
-        # Reinstall path: if a previously soft-deleted row matches, restore
-        # it by clearing deleted_at in defaults — otherwise update_or_create
-        # would update fields but leave the row inactive.
-        # Use `all_objects` so a soft-deleted row is found and restored;
-        # `objects` filters deleted_at__isnull=True and would insert a
-        # duplicate row instead.
-        cred, _ = WorkspaceCredential.all_objects.update_or_create(
-            workspace=ws,
-            source="slack",
-            source_identifier=team_id,
-            defaults={
-                "user": installer,
-                "source_access_token": access_token,
-                "source_refresh_token": refresh_token,
-                "source_token_expires_at": expires_at,
-                "source_authorization_type": (
-                    "OAUTH_ROTATING" if refresh_token else "OAUTH"
-                ),
-                "is_pat": False,
-                "is_active": True,
-                "deleted_at": None,
-            },
-        )
-        conn, _ = WorkspaceConnection.all_objects.update_or_create(
-            workspace=ws,
-            connection_type="slack",
-            connection_id=team_id,
-            defaults={
-                "credential": cred,
-                "connection_slug": team_name,
-                "connection_data": {"bot_user_id": bot_user_id, "team_name": team_name},
-                "scopes": [s for s in scope.split(",") if s],
-                "config": {},
-                "deleted_at": None,
-            },
-        )
+        # Reinstall path: restore a previously soft-deleted row instead of
+        # inserting a duplicate. The unique constraints are conditional on
+        # `deleted_at IS NULL`, so multiple soft-deleted rows can exist for
+        # the same lookup keys — `all_objects.update_or_create` would
+        # MultipleObjectsReturned in that case. Prefer the live row, then
+        # the most recent soft-deleted, then create.
+        cred_defaults = {
+            "user": installer,
+            "source_access_token": access_token,
+            "source_refresh_token": refresh_token,
+            "source_token_expires_at": expires_at,
+            "source_authorization_type": "OAUTH_ROTATING" if refresh_token else "OAUTH",
+            "is_pat": False,
+            "is_active": True,
+            "deleted_at": None,
+        }
+        cred = WorkspaceCredential.objects.filter(
+            workspace=ws, source="slack", source_identifier=team_id
+        ).first()
+        if not cred:
+            cred = (
+                WorkspaceCredential.all_objects.filter(
+                    workspace=ws, source="slack", source_identifier=team_id
+                )
+                .order_by("-deleted_at")
+                .first()
+            )
+        if cred:
+            for k, v in cred_defaults.items():
+                setattr(cred, k, v)
+            cred.save()
+        else:
+            cred = WorkspaceCredential.objects.create(
+                workspace=ws, source="slack", source_identifier=team_id, **cred_defaults
+            )
+
+        conn_defaults = {
+            "credential": cred,
+            "connection_slug": team_name,
+            "connection_data": {"bot_user_id": bot_user_id, "team_name": team_name},
+            "scopes": [s for s in scope.split(",") if s],
+            "config": {},
+            "deleted_at": None,
+        }
+        conn = WorkspaceConnection.objects.filter(
+            workspace=ws, connection_type="slack", connection_id=team_id
+        ).first()
+        if not conn:
+            conn = (
+                WorkspaceConnection.all_objects.filter(
+                    workspace=ws, connection_type="slack", connection_id=team_id
+                )
+                .order_by("-deleted_at")
+                .first()
+            )
+        if conn:
+            for k, v in conn_defaults.items():
+                setattr(conn, k, v)
+            conn.save()
+        else:
+            conn = WorkspaceConnection.objects.create(
+                workspace=ws, connection_type="slack", connection_id=team_id, **conn_defaults
+            )
         return Response(
             {
                 "credential_id": str(cred.id),
@@ -344,25 +371,42 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Reconnect path: clear deleted_at so a previously soft-deleted
-        # row gets restored instead of staying inactive. Use `all_objects`
-        # so a soft-deleted row is actually findable.
-        conn, created = WorkspaceUserConnection.all_objects.update_or_create(
-            workspace=ws,
-            user=user,
-            connection_type="slack",
-            defaults={
-                "credential": cred,
-                "connection_id": slack_user_id,
-                "connection_data": {
-                    "slack_team_id": slack_team_id,
-                    "slack_user_email": slack_user_email,
-                },
-                "scopes": [],
-                "config": {},
-                "deleted_at": None,
+        # Reconnect path: restore the prior soft-deleted row when one
+        # exists, but never call update_or_create on `all_objects` —
+        # the unique constraint is conditional on deleted_at IS NULL,
+        # so multiple soft-deleted rows can exist and collide.
+        user_conn_defaults = {
+            "credential": cred,
+            "connection_id": slack_user_id,
+            "connection_data": {
+                "slack_team_id": slack_team_id,
+                "slack_user_email": slack_user_email,
             },
-        )
+            "scopes": [],
+            "config": {},
+            "deleted_at": None,
+        }
+        conn = WorkspaceUserConnection.objects.filter(
+            workspace=ws, user=user, connection_type="slack"
+        ).first()
+        if not conn:
+            conn = (
+                WorkspaceUserConnection.all_objects.filter(
+                    workspace=ws, user=user, connection_type="slack"
+                )
+                .order_by("-deleted_at")
+                .first()
+            )
+        if conn:
+            created = False
+            for k, v in user_conn_defaults.items():
+                setattr(conn, k, v)
+            conn.save()
+        else:
+            created = True
+            conn = WorkspaceUserConnection.objects.create(
+                workspace=ws, user=user, connection_type="slack", **user_conn_defaults
+            )
         return Response(
             {"id": str(conn.id), "created": created},
             status=status.HTTP_200_OK,
