@@ -116,6 +116,9 @@ class SiloSlackInstallEndpoint(BaseAPIView):
         if isinstance(expires_in, (int, float)) and expires_in > 0:
             expires_at = timezone.now() + timedelta(seconds=int(expires_in))
 
+        # Reinstall path: if a previously soft-deleted row matches, restore
+        # it by clearing deleted_at in defaults — otherwise update_or_create
+        # would update fields but leave the row inactive.
         cred, _ = WorkspaceCredential.objects.update_or_create(
             workspace=ws,
             source="slack",
@@ -130,6 +133,7 @@ class SiloSlackInstallEndpoint(BaseAPIView):
                 ),
                 "is_pat": False,
                 "is_active": True,
+                "deleted_at": None,
             },
         )
         conn, _ = WorkspaceConnection.objects.update_or_create(
@@ -142,6 +146,7 @@ class SiloSlackInstallEndpoint(BaseAPIView):
                 "connection_data": {"bot_user_id": bot_user_id, "team_name": team_name},
                 "scopes": [s for s in scope.split(",") if s],
                 "config": {},
+                "deleted_at": None,
             },
         )
         return Response(
@@ -177,9 +182,17 @@ class SiloSlackTeamContextEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Skip soft-deleted connections (and connections whose credential
+        # was soft-deleted out from under them) so silo never resolves
+        # context for an integration that's been removed.
         conn = (
             WorkspaceConnection.objects.select_related("workspace", "credential")
-            .filter(connection_type="slack", connection_id=team_id)
+            .filter(
+                connection_type="slack",
+                connection_id=team_id,
+                deleted_at__isnull=True,
+                credential__deleted_at__isnull=True,
+            )
             .first()
         )
         if not conn:
@@ -314,6 +327,8 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        # Reconnect path: clear deleted_at so a previously soft-deleted
+        # row gets restored instead of staying inactive.
         conn, created = WorkspaceUserConnection.objects.update_or_create(
             workspace=ws,
             user=user,
@@ -327,6 +342,7 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
                 },
                 "scopes": [],
                 "config": {},
+                "deleted_at": None,
             },
         )
         return Response(
@@ -457,8 +473,17 @@ class SiloProjectMappingsEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Filter out soft-deleted entity connections, plus mappings whose
+        # parent workspace_connection or its credential were soft-deleted —
+        # otherwise silo would keep fanning out events to dead integrations.
         ws = get_object_or_404(Workspace, slug=slug)
-        qs = WorkspaceEntityConnection.objects.filter(workspace=ws, project_id=project_id)
+        qs = WorkspaceEntityConnection.objects.filter(
+            workspace=ws,
+            project_id=project_id,
+            deleted_at__isnull=True,
+            workspace_connection__deleted_at__isnull=True,
+            workspace_connection__credential__deleted_at__isnull=True,
+        )
         if mapping_type:
             qs = qs.filter(type=mapping_type)
 
