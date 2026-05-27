@@ -77,16 +77,24 @@ export const refreshBotToken = async (teamId: string): Promise<string | null> =>
       // response, and the backoff sleep is intentional.
       // eslint-disable-next-line no-await-in-loop
       for (let attempt = 0; attempt < 5; attempt += 1) {
-        // eslint-disable-next-line no-await-in-loop
-        persist = await callDjango("POST", "/api/v1/silo/slack/persist-tokens/", {
-          team_id: teamId,
-          access_token: r.access_token,
-          refresh_token: r.refresh_token ?? "",
-          expires_in: r.expires_in ?? null,
-        });
-        if (persist.status < 300) break;
-        lastErr = `${persist.status} ${JSON.stringify(persist.data)}`;
-        if (persist.status >= 400 && persist.status < 500 && persist.status !== 429) break;
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          persist = await callDjango("POST", "/api/v1/silo/slack/persist-tokens/", {
+            team_id: teamId,
+            access_token: r.access_token,
+            refresh_token: r.refresh_token ?? "",
+            expires_in: r.expires_in ?? null,
+          });
+          if (persist.status < 300) break;
+          lastErr = `${persist.status} ${JSON.stringify(persist.data)}`;
+          if (persist.status >= 400 && persist.status < 500 && persist.status !== 429) break;
+        } catch (err) {
+          // Network/DNS/timeout: retry with backoff just like a 5xx.
+          // Without this catch, the outer try would unwind before we
+          // ever get to the second attempt.
+          lastErr = (err as Error).message;
+          persist = undefined;
+        }
         if (attempt < 4) {
           const backoffMs = 200 * 2 ** attempt;
           // eslint-disable-next-line no-await-in-loop

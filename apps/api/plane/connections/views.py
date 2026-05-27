@@ -476,20 +476,28 @@ class SiloCreateCommentEndpoint(BaseAPIView):
 
         comment_stripped = BeautifulSoup(comment_html, "html.parser").get_text(separator="\n").strip()
 
-        comment = IssueComment.objects.create(
-            issue=issue,
-            project=project,
-            workspace=ws,
-            actor=actor,
-            comment_html=comment_html,
-            comment_stripped=comment_stripped,
-        )
-        # BaseModel.save clobbered created_by — fix it. Same updated_by
-        # alignment as create-work-item: comment creator is the initial
-        # updater, audit columns must agree.
-        IssueComment.objects.filter(pk=comment.id).update(
-            created_by_id=actor.id, actor_id=actor.id, updated_by_id=actor.id
-        )
+        # BaseModel.save reads the actor via crum's get_current_user. The
+        # silo HMAC principal is anonymous, so without overriding the
+        # thread-local user we'd land created_by=None and have to chase
+        # it with a post-create .update() (which bypasses Django signals
+        # and audit logging). Set the thread-local to the resolved actor
+        # so the initial save attributes correctly and all on_save hooks
+        # see the right user. Reset in `finally` so we never leak crum
+        # state into another request that reuses this worker thread.
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        set_current_user(actor)
+        try:
+            comment = IssueComment.objects.create(
+                issue=issue,
+                project=project,
+                workspace=ws,
+                actor=actor,
+                comment_html=comment_html,
+                comment_stripped=comment_stripped,
+            )
+        finally:
+            set_current_user(prev_user)
 
         # Fire activity so silo notification fan-out runs.
         from plane.bgtasks.issue_activities_task import issue_activity
@@ -714,17 +722,21 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        serializer.save()
 
-        # BaseModel.save() looks up the current user via crum and would
-        # clobber created_by back to None for silo (anonymous principal).
-        # Use queryset .update() to bypass model save entirely. Set
-        # updated_by_id too — on a fresh row the creator is also the
-        # initial updater, and the audit columns are expected to agree.
-        Issue.objects.filter(pk=serializer.data["id"]).update(
-            created_by_id=actor.id, updated_by_id=actor.id
-        )
-        issue = Issue.objects.get(pk=serializer.data["id"])
+        # BaseModel.save reads the actor via crum's get_current_user. The
+        # silo HMAC principal is anonymous, so without overriding the
+        # thread-local user the initial save lands created_by=None and
+        # any on_save signals run with the wrong actor. Set the thread-
+        # local for the duration of the save and restore it after, so we
+        # don't leak crum state into another request on the same worker.
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        set_current_user(actor)
+        try:
+            serializer.save()
+        finally:
+            set_current_user(prev_user)
+        issue = serializer.instance
 
         # Fire the same activity hook as the public IssueListCreate
         # endpoint so downstream listeners (the silo Slack-notification

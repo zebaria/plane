@@ -98,7 +98,7 @@ def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -
     comment body can't be parsed as Slack formatting; the mention
     tokens we emit stay literal.
     """
-    from bs4 import BeautifulSoup, NavigableString
+    from bs4 import BeautifulSoup, Comment, NavigableString
 
     if comment is None:
         return ""
@@ -140,6 +140,10 @@ def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -
             name_by_plane[str(u.id)] = u.display_name or u.email or "user"
 
     def render(node) -> str:
+        # Comment is a NavigableString subclass — guard before the generic
+        # NavigableString branch so HTML comments don't leak into Slack.
+        if isinstance(node, Comment):
+            return ""
         if isinstance(node, NavigableString):
             return _slack_escape(str(node))
         if getattr(node, "name", None) == "mention-component":
