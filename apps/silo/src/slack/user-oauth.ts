@@ -41,6 +41,14 @@ type StateEntry = {
 };
 const stateStore = new Map<string, StateEntry>();
 
+// Sweep abandoned OAuth flows; same pattern as Slack team OAuth.
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of stateStore) {
+    if (now - entry.createdAt > STATE_TTL_MS) stateStore.delete(token);
+  }
+}, STATE_TTL_MS).unref();
+
 const issueState = (workspaceSlug: string, planeUserId: string): string => {
   const token = randomBytes(24).toString("hex");
   stateStore.set(token, { workspaceSlug, planeUserId, createdAt: Date.now() });

@@ -71,6 +71,11 @@ def _silo_url(path: str) -> str:
 
 def _sign(method: str, path_with_silo_base: str, body: str) -> tuple[str, str]:
     secret = getattr(settings, "SILO_HMAC_SECRET_KEY", "") or ""
+    if not secret:
+        # Without the shared secret we'd sign with "" — silo would 401
+        # every request anyway, but the failure mode is silent and
+        # confusing. Surface it loudly at the dispatch site instead.
+        raise ValueError("SILO_HMAC_SECRET_KEY is not configured")
     ts = str(int(time.time()))
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     msg = f"{ts}.{method.upper()}.{path_with_silo_base}.{body_hash}"
@@ -309,6 +314,9 @@ def dispatch_silo_work_item_event(
             # than bare UUIDs — set() of dicts raises TypeError.
             def _assignee_ids(d: dict) -> set[str]:
                 vals = d.get("assignee_ids") or d.get("assignees") or []
+                # A bare string would iterate character-by-character below.
+                if isinstance(vals, str):
+                    vals = [vals]
                 out: set[str] = set()
                 for v in vals:
                     if isinstance(v, dict):

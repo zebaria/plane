@@ -424,7 +424,7 @@ class SiloCreateCommentEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from bs4 import BeautifulSoup
+        from plane.api.serializers import IssueCommentSerializer
         from plane.db.models import Issue, IssueComment, Project, User
 
         data = request.data or {}
@@ -474,27 +474,28 @@ class SiloCreateCommentEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        comment_stripped = BeautifulSoup(comment_html, "html.parser").get_text(separator="\n").strip()
+        # Go through IssueCommentSerializer so comment_html is sanitized
+        # and comment_json (Lexical editor format) is populated — the FE
+        # comment renderer reads comment_json, so a direct ORM create
+        # would render as an empty bubble.
+        serializer = IssueCommentSerializer(data={"comment_html": comment_html})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         # BaseModel.save reads the actor via crum's get_current_user. The
         # silo HMAC principal is anonymous, so without overriding the
-        # thread-local user we'd land created_by=None and have to chase
-        # it with a post-create .update() (which bypasses Django signals
-        # and audit logging). Set the thread-local to the resolved actor
-        # so the initial save attributes correctly and all on_save hooks
-        # see the right user. Reset in `finally` so we never leak crum
-        # state into another request that reuses this worker thread.
+        # thread-local user we'd land created_by=None and any on_save
+        # signals would run with the wrong actor. Reset in `finally` so
+        # we never leak crum state into another request on the same worker.
         from crum import set_current_user, get_current_user
         prev_user = get_current_user()
         set_current_user(actor)
         try:
-            comment = IssueComment.objects.create(
-                issue=issue,
-                project=project,
-                workspace=ws,
+            comment = serializer.save(
+                project_id=project.id,
+                issue_id=issue.id,
+                workspace_id=ws.id,
                 actor=actor,
-                comment_html=comment_html,
-                comment_stripped=comment_stripped,
             )
         finally:
             set_current_user(prev_user)

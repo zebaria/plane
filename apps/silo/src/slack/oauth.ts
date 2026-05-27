@@ -46,6 +46,16 @@ const STATE_TTL_MS = 10 * 60 * 1000;
 type StateEntry = { workspaceSlug: string; userId: string; createdAt: number };
 const stateStore = new Map<string, StateEntry>();
 
+// Without periodic cleanup, abandoned OAuth flows (user starts auth, never
+// returns) accumulate forever. Sweep every TTL window. unref() so the
+// timer never holds the event loop open at shutdown.
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of stateStore) {
+    if (now - entry.createdAt > STATE_TTL_MS) stateStore.delete(token);
+  }
+}, STATE_TTL_MS).unref();
+
 const issueState = (workspaceSlug: string, userId: string): string => {
   const token = randomBytes(24).toString("hex");
   stateStore.set(token, { workspaceSlug, userId, createdAt: Date.now() });
