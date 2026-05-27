@@ -33,6 +33,7 @@ export const callSlackApi = async <T extends SlackApiResponse = SlackApiResponse
       Authorization: `Bearer ${botToken}`,
       "Content-Type": "application/json; charset=utf-8",
     },
+    timeout: 10000,
     validateStatus: () => true,
   });
   return res.data;

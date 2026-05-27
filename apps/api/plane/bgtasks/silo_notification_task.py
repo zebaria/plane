@@ -277,9 +277,22 @@ def dispatch_silo_work_item_event(
                 # field changes for v1 notifications.
                 return
 
+            # Validate state UUIDs before the queryset filter — Django
+            # raises ValidationError on bad strings ("null", "undefined")
+            # and dirties the Celery logs.
+            valid_state_ids = []
+            for sid in (new_state_id, prev_state_id):
+                try:
+                    uuid.UUID(str(sid))
+                    valid_state_ids.append(str(sid))
+                except ValueError:
+                    pass
+            if len(valid_state_ids) < 2:
+                return
+
             states = {
                 str(s.id): s
-                for s in State.objects.filter(id__in=[new_state_id, prev_state_id])
+                for s in State.objects.filter(id__in=valid_state_ids)
             }
             new_state = states.get(str(new_state_id))
             prev_state = states.get(str(prev_state_id))

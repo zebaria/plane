@@ -42,6 +42,7 @@ export const callDjango = async <T = unknown>(
     },
     data: raw || undefined,
     transformRequest: [(d) => d],
+    timeout: 10000,
     validateStatus: () => true,
   };
   return axios.request<T>(opts);

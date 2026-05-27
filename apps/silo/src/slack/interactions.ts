@@ -93,20 +93,26 @@ const handleCreateWorkItem = async (payload: SlackViewSubmission): Promise<ViewS
   // else slack_user_id → WorkspaceUserConnection, else slack_team_id
   // → installer. We pass slack_user_id + slack_team_id and let
   // Django decide.
-  const r = await callDjango<{
-    id: string;
-    sequence_id: number;
-    project_identifier: string;
-    name: string;
-    url: string;
-  }>("POST", "/api/v1/silo/work-items/", {
-    workspace_slug: metadata.workspaceSlug,
-    project_id: projectId,
-    title,
-    description,
-    slack_user_id: slackUserId,
-    slack_team_id: teamId,
-  });
+  let r;
+  try {
+    r = await callDjango<{
+      id: string;
+      sequence_id: number;
+      project_identifier: string;
+      name: string;
+      url: string;
+    }>("POST", "/api/v1/silo/work-items/", {
+      workspace_slug: metadata.workspaceSlug,
+      project_id: projectId,
+      title,
+      description,
+      slack_user_id: slackUserId,
+      slack_team_id: teamId,
+    });
+  } catch (err) {
+    console.error("[silo] work-item create network error:", err);
+    return errorResponse({ title: "Could not reach Plane — try again" });
+  }
 
   if (r.status >= 300) {
     console.error(`[silo] work-item create failed: ${r.status} ${JSON.stringify(r.data)}`);
@@ -211,14 +217,20 @@ const handleReplyCommentSubmit = async (payload: SlackViewSubmission): Promise<V
     .map((line) => line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"))
     .join("</p><p>")}</p>`;
 
-  const r = await callDjango<{ id: string }>("POST", "/api/v1/silo/comments/", {
-    workspace_slug: metadata.workspace_slug,
-    project_id: metadata.project_id,
-    issue_id: metadata.issue_id,
-    comment_html: commentHtml,
-    slack_user_id: slackUserId,
-    slack_team_id: teamId,
-  });
+  let r;
+  try {
+    r = await callDjango<{ id: string }>("POST", "/api/v1/silo/comments/", {
+      workspace_slug: metadata.workspace_slug,
+      project_id: metadata.project_id,
+      issue_id: metadata.issue_id,
+      comment_html: commentHtml,
+      slack_user_id: slackUserId,
+      slack_team_id: teamId,
+    });
+  } catch (err) {
+    console.error("[silo] comment create network error:", err);
+    return errorResponse({ comment: "Could not reach Plane — try again" });
+  }
 
   if (r.status >= 300) {
     console.error(`[silo] comment create failed: ${r.status} ${JSON.stringify(r.data)}`);
