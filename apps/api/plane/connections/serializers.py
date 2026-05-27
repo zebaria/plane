@@ -73,6 +73,14 @@ class WorkspaceConnectionSerializer(BaseSerializer):
         queryset=WorkspaceCredential.objects.all(),
     )
 
+    def validate_credential_id(self, value):
+        # Cross-workspace guard: reject a credential UUID that belongs to a
+        # different workspace than the one the view scoped us to.
+        ws = self.context.get("workspace")
+        if ws is not None and value.workspace_id != ws.id:
+            raise serializers.ValidationError("credential does not belong to this workspace")
+        return value
+
     class Meta:
         model = WorkspaceConnection
         fields = (
@@ -102,6 +110,12 @@ class WorkspaceUserConnectionSerializer(BaseSerializer):
         source="credential",
         queryset=WorkspaceCredential.objects.all(),
     )
+
+    def validate_credential_id(self, value):
+        ws = self.context.get("workspace")
+        if ws is not None and value.workspace_id != ws.id:
+            raise serializers.ValidationError("credential does not belong to this workspace")
+        return value
 
     class Meta:
         model = WorkspaceUserConnection
@@ -145,6 +159,24 @@ class WorkspaceEntityConnectionSerializer(BaseSerializer):
     issue_id = serializers.PrimaryKeyRelatedField(
         source="issue", queryset=Issue.objects.all(), required=False, allow_null=True
     )
+
+    def validate(self, attrs):
+        # Cross-workspace guard: every related FK must belong to the same
+        # workspace the view scoped us to. Without this, a caller could
+        # pass a workspace_connection / project / issue UUID from another
+        # workspace and create a row that crosses tenants.
+        ws = self.context.get("workspace")
+        if ws is not None:
+            wc = attrs.get("workspace_connection")
+            if wc is not None and wc.workspace_id != ws.id:
+                raise serializers.ValidationError({"workspace_connection_id": "wrong workspace"})
+            project = attrs.get("project")
+            if project is not None and project.workspace_id != ws.id:
+                raise serializers.ValidationError({"project_id": "wrong workspace"})
+            issue = attrs.get("issue")
+            if issue is not None and issue.workspace_id != ws.id:
+                raise serializers.ValidationError({"issue_id": "wrong workspace"})
+        return attrs
 
     class Meta:
         model = WorkspaceEntityConnection

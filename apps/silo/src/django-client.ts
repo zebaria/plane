@@ -15,8 +15,12 @@ import { config } from "./config";
 
 const sign = (method: string, path: string, body: string): { ts: string; sig: string } => {
   const ts = Math.floor(Date.now() / 1000).toString();
+  // Django's SiloHMACAuthentication signs against request.path (no
+  // query string). Strip query params here so a GET path like
+  // "/api/v1/silo/foo/?x=1" still verifies on the Django side.
+  const cleanPath = path.split("?")[0];
   const bodyHash = createHash("sha256").update(body).digest("hex");
-  const msg = `${ts}.${method.toUpperCase()}.${path}.${bodyHash}`;
+  const msg = `${ts}.${method.toUpperCase()}.${cleanPath}.${bodyHash}`;
   const sig = createHmac("sha256", config.hmacSecret).update(msg).digest("hex");
   return { ts, sig };
 };

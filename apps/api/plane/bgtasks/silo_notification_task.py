@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 import requests
 from celery import shared_task
@@ -77,6 +78,12 @@ def _sign(method: str, path_with_silo_base: str, body: str) -> tuple[str, str]:
     return ts, sig
 
 
+def _slack_escape(text: str) -> str:
+    """Escape `&`, `<`, `>` so Slack mrkdwn doesn't try to parse raw text
+    as formatting/links. Slack expects HTML-entity-style escapes here."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -> str:
     """Convert a Plane comment's HTML into Slack-mrkdwn-friendly text.
 
@@ -86,52 +93,70 @@ def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -
     pachuko" — the @-mention vanishes. Re-render each mention as
     `<@SLACK_USER_ID>` (Slack mention syntax) for users who have
     linked their Slack identity, or `@DisplayName` as a fallback.
+
+    All non-mention text is Slack-escaped so raw `<`/`>`/`&` in the
+    comment body can't be parsed as Slack formatting; the mention
+    tokens we emit stay literal.
     """
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, NavigableString
 
     if comment is None:
         return ""
 
     html = comment.comment_html or ""
     if "mention-component" not in html:
-        # Fast path — comment has no mentions, plain stripped text is fine.
-        return comment.comment_stripped or ""
+        return _slack_escape(comment.comment_stripped or "")
 
     soup = BeautifulSoup(html, "html.parser")
-    plane_user_ids = {
+    raw_ids = {
         tag.get("entity_identifier")
         for tag in soup.find_all("mention-component", attrs={"entity_name": "user_mention"})
         if tag.get("entity_identifier")
     }
-    if not plane_user_ids:
-        return comment.comment_stripped or ""
+    if not raw_ids:
+        return _slack_escape(comment.comment_stripped or "")
+
+    # Validate UUIDs before passing them to the ORM; bad strings raise
+    # ValidationError deep in the queryset.
+    plane_user_ids: set[str] = set()
+    for uid in raw_ids:
+        try:
+            uuid.UUID(str(uid))
+            plane_user_ids.add(str(uid))
+        except ValueError:
+            continue
 
     slack_by_plane: dict[str, str] = {}
-    for m in WorkspaceUserConnection.objects.filter(
-        workspace_id=workspace_id,
-        connection_type="slack",
-        user_id__in=plane_user_ids,
-        deleted_at__isnull=True,
-    ).select_related("user"):
-        slack_by_plane[str(m.user_id)] = m.connection_id
-
     name_by_plane: dict[str, str] = {}
-    for u in User.objects.filter(id__in=plane_user_ids):
-        name_by_plane[str(u.id)] = u.display_name or u.email or "user"
+    if plane_user_ids:
+        for m in WorkspaceUserConnection.objects.filter(
+            workspace_id=workspace_id,
+            connection_type="slack",
+            user_id__in=plane_user_ids,
+            deleted_at__isnull=True,
+        ).select_related("user"):
+            slack_by_plane[str(m.user_id)] = m.connection_id
+        for u in User.objects.filter(id__in=plane_user_ids):
+            name_by_plane[str(u.id)] = u.display_name or u.email or "user"
 
-    for tag in soup.find_all("mention-component", attrs={"entity_name": "user_mention"}):
-        plane_uid = tag.get("entity_identifier")
-        if not plane_uid:
-            tag.replace_with("")
-            continue
-        slack_uid = slack_by_plane.get(str(plane_uid))
-        if slack_uid:
-            tag.replace_with(f"<@{slack_uid}>")
-        else:
-            tag.replace_with(f"@{name_by_plane.get(str(plane_uid), 'user')}")
+    def render(node) -> str:
+        if isinstance(node, NavigableString):
+            return _slack_escape(str(node))
+        if getattr(node, "name", None) == "mention-component":
+            plane_uid = node.get("entity_identifier")
+            if not plane_uid:
+                return ""
+            slack_uid = slack_by_plane.get(str(plane_uid))
+            if slack_uid:
+                return f"<@{slack_uid}>"
+            return f"@{name_by_plane.get(str(plane_uid), 'user')}"
+        parts = [render(child) for child in node.children]
+        text = "".join(parts)
+        if getattr(node, "name", None) in ("p", "div", "li", "br"):
+            return text + "\n"
+        return text
 
-    # noinspection PyArgumentList
-    return soup.get_text(separator="\n").strip()
+    return render(soup).strip()
 
 
 @shared_task
@@ -150,6 +175,18 @@ def dispatch_silo_work_item_event(
     activity without measurable cost.
     """
     try:
+        # Fail fast on malformed UUIDs — querying with a bad string raises
+        # ValidationError deep in the ORM and dirties the logs.
+        try:
+            if project_id:
+                uuid.UUID(str(project_id))
+            if issue_id:
+                uuid.UUID(str(issue_id))
+            if actor_id:
+                uuid.UUID(str(actor_id))
+        except ValueError:
+            return
+
         event_type = ACTIVITY_EVENT_MAP.get(activity_type)
         if not event_type:
             return

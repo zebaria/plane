@@ -126,7 +126,10 @@ class SiloSlackInstallEndpoint(BaseAPIView):
         # Reinstall path: if a previously soft-deleted row matches, restore
         # it by clearing deleted_at in defaults — otherwise update_or_create
         # would update fields but leave the row inactive.
-        cred, _ = WorkspaceCredential.objects.update_or_create(
+        # Use `all_objects` so a soft-deleted row is found and restored;
+        # `objects` filters deleted_at__isnull=True and would insert a
+        # duplicate row instead.
+        cred, _ = WorkspaceCredential.all_objects.update_or_create(
             workspace=ws,
             source="slack",
             source_identifier=team_id,
@@ -143,7 +146,7 @@ class SiloSlackInstallEndpoint(BaseAPIView):
                 "deleted_at": None,
             },
         )
-        conn, _ = WorkspaceConnection.objects.update_or_create(
+        conn, _ = WorkspaceConnection.all_objects.update_or_create(
             workspace=ws,
             connection_type="slack",
             connection_id=team_id,
@@ -199,6 +202,7 @@ class SiloSlackTeamContextEndpoint(BaseAPIView):
                 connection_id=team_id,
                 deleted_at__isnull=True,
                 credential__deleted_at__isnull=True,
+                workspace__deleted_at__isnull=True,
             )
             .first()
         )
@@ -341,8 +345,9 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
             )
 
         # Reconnect path: clear deleted_at so a previously soft-deleted
-        # row gets restored instead of staying inactive.
-        conn, created = WorkspaceUserConnection.objects.update_or_create(
+        # row gets restored instead of staying inactive. Use `all_objects`
+        # so a soft-deleted row is actually findable.
+        conn, created = WorkspaceUserConnection.all_objects.update_or_create(
             workspace=ws,
             user=user,
             connection_type="slack",
@@ -731,7 +736,7 @@ class WorkspaceCredentialListCreateEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def post(self, request, slug):
         ws = _workspace(slug)
-        serializer = WorkspaceCredentialSerializer(data=request.data)
+        serializer = WorkspaceCredentialSerializer(data=request.data, context={"workspace": ws})
         serializer.is_valid(raise_exception=True)
         serializer.save(workspace=ws, user=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -799,7 +804,7 @@ class WorkspaceConnectionListCreateEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def post(self, request, slug):
         ws = _workspace(slug)
-        serializer = WorkspaceConnectionSerializer(data=request.data)
+        serializer = WorkspaceConnectionSerializer(data=request.data, context={"workspace": ws})
         serializer.is_valid(raise_exception=True)
         serializer.save(workspace=ws)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -818,7 +823,9 @@ class WorkspaceConnectionDetailEndpoint(BaseAPIView):
         conn = get_object_or_404(
             WorkspaceConnection, workspace__slug=slug, pk=pk, deleted_at__isnull=True
         )
-        serializer = WorkspaceConnectionSerializer(conn, data=request.data, partial=True)
+        serializer = WorkspaceConnectionSerializer(
+            conn, data=request.data, partial=True, context={"workspace": conn.workspace}
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
@@ -851,7 +858,7 @@ class WorkspaceUserConnectionListCreateEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
     def post(self, request, slug):
         ws = _workspace(slug)
-        serializer = WorkspaceUserConnectionSerializer(data=request.data)
+        serializer = WorkspaceUserConnectionSerializer(data=request.data, context={"workspace": ws})
         serializer.is_valid(raise_exception=True)
         serializer.save(workspace=ws, user=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -900,7 +907,7 @@ class WorkspaceEntityConnectionListCreateEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def post(self, request, slug):
         ws = _workspace(slug)
-        serializer = WorkspaceEntityConnectionSerializer(data=request.data)
+        serializer = WorkspaceEntityConnectionSerializer(data=request.data, context={"workspace": ws})
         serializer.is_valid(raise_exception=True)
         serializer.save(workspace=ws)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -915,7 +922,9 @@ class WorkspaceEntityConnectionDetailEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def patch(self, request, slug, pk):
         conn = get_object_or_404(WorkspaceEntityConnection, workspace__slug=slug, pk=pk)
-        serializer = WorkspaceEntityConnectionSerializer(conn, data=request.data, partial=True)
+        serializer = WorkspaceEntityConnectionSerializer(
+            conn, data=request.data, partial=True, context={"workspace": conn.workspace}
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)

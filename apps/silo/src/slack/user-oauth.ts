@@ -26,7 +26,7 @@ import axios from "axios";
 import type { Request, Response, Router } from "express";
 import express from "express";
 
-import { getSlackConfig } from "../config";
+import { config, getSlackConfig } from "../config";
 import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
 
@@ -75,9 +75,7 @@ type SlackUsersIdentityResponse = {
 };
 
 const userRedirectUrl = (): string => {
-  const base = process.env.SILO_PUBLIC_BASE_URL ?? "http://localhost:3005";
-  const path = process.env.SILO_BASE_PATH ?? "/silo";
-  return `${base}${path}/api/slack/user/auth/callback`;
+  return `${config.publicBaseUrl}${config.basePath}/api/slack/user/auth/callback`;
 };
 
 export const buildUserAuthorizeUrl = (state: string): string => {

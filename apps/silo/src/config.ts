@@ -31,7 +31,9 @@ export const config = {
   basePath: process.env.SILO_BASE_PATH ?? "/silo",
   publicBaseUrl: process.env.SILO_PUBLIC_BASE_URL ?? "http://localhost:3005",
   env: process.env.SILO_ENV ?? "dev",
-  hmacSecret: required("SILO_HMAC_SECRET_KEY", "dev-insecure-silo-hmac"),
+  // Production must set SILO_HMAC_SECRET_KEY explicitly — the dev
+  // fallback would silently leave service-to-service auth wide open.
+  hmacSecret: required("SILO_HMAC_SECRET_KEY", process.env.SILO_ENV === "prod" ? undefined : "dev-insecure-silo-hmac"),
   apiInternalBaseUrl: process.env.API_INTERNAL_BASE_URL ?? "http://localhost:8800",
 };
 
