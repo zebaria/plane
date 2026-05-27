@@ -112,9 +112,16 @@ class SiloSlackInstallEndpoint(BaseAPIView):
         ws = get_object_or_404(Workspace, slug=slug)
         installer = get_object_or_404(User, pk=installer_user_id)
 
+        # Slack typically sends expires_in as an int, but accept stringy
+        # numeric values too — silo passes the raw OAuth response through.
         expires_at = None
-        if isinstance(expires_in, (int, float)) and expires_in > 0:
-            expires_at = timezone.now() + timedelta(seconds=int(expires_in))
+        if expires_in is not None:
+            try:
+                expires_in_val = int(expires_in)
+                if expires_in_val > 0:
+                    expires_at = timezone.now() + timedelta(seconds=expires_in_val)
+            except (ValueError, TypeError):
+                pass
 
         # Reinstall path: if a previously soft-deleted row matches, restore
         # it by clearing deleted_at in defaults — otherwise update_or_create
@@ -255,28 +262,34 @@ class SiloSlackPersistTokensEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        cred = WorkspaceCredential.objects.filter(
-            source="slack", source_identifier=team_id
-        ).first()
-        if not cred:
+        # The same Slack team can be installed in multiple Plane
+        # workspaces. Update every live credential row for this team
+        # so rotation doesn't leave other workspaces with a stale token.
+        creds = WorkspaceCredential.objects.filter(
+            source="slack",
+            source_identifier=team_id,
+            deleted_at__isnull=True,
+        )
+        if not creds.exists():
             return Response(
                 {"detail": "no Slack credential for that team_id"},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        cred.source_access_token = access_token
+        update_fields: dict = {
+            "source_access_token": access_token,
+            "updated_at": timezone.now(),
+        }
         if refresh_token:
-            cred.source_refresh_token = refresh_token
-        if isinstance(expires_in, (int, float)) and expires_in > 0:
-            cred.source_token_expires_at = timezone.now() + timedelta(seconds=int(expires_in))
-        cred.save(
-            update_fields=[
-                "source_access_token",
-                "source_refresh_token",
-                "source_token_expires_at",
-                "updated_at",
-            ]
-        )
+            update_fields["source_refresh_token"] = refresh_token
+        if expires_in is not None:
+            try:
+                expires_in_val = int(expires_in)
+                if expires_in_val > 0:
+                    update_fields["source_token_expires_at"] = timezone.now() + timedelta(seconds=expires_in_val)
+            except (ValueError, TypeError):
+                pass
+        creds.update(**update_fields)
         return Response({"ok": True}, status=status.HTTP_200_OK)
 
 
@@ -422,8 +435,12 @@ class SiloCreateCommentEndpoint(BaseAPIView):
             comment_html=comment_html,
             comment_stripped=comment_stripped,
         )
-        # BaseModel.save clobbered created_by — fix it.
-        IssueComment.objects.filter(pk=comment.id).update(created_by_id=actor.id, actor_id=actor.id)
+        # BaseModel.save clobbered created_by — fix it. Same updated_by
+        # alignment as create-work-item: comment creator is the initial
+        # updater, audit columns must agree.
+        IssueComment.objects.filter(pk=comment.id).update(
+            created_by_id=actor.id, actor_id=actor.id, updated_by_id=actor.id
+        )
 
         # Fire activity so silo notification fan-out runs.
         from plane.bgtasks.issue_activities_task import issue_activity
@@ -467,23 +484,28 @@ class SiloProjectMappingsEndpoint(BaseAPIView):
         project_id = data.get("project_id")
         mapping_type = data.get("type")
 
-        if not (slug and project_id):
+        if not slug:
             return Response(
-                {"detail": "workspace_slug and project_id required"},
+                {"detail": "workspace_slug required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Filter out soft-deleted entity connections, plus mappings whose
         # parent workspace_connection or its credential were soft-deleted —
         # otherwise silo would keep fanning out events to dead integrations.
+        # project_id is optional: silo's DM-target path needs to discover
+        # a workspace's Slack team_id even when no channel mapping exists
+        # for the project, so we expose all live workspace mappings when
+        # project_id is omitted.
         ws = get_object_or_404(Workspace, slug=slug)
         qs = WorkspaceEntityConnection.objects.filter(
             workspace=ws,
-            project_id=project_id,
             deleted_at__isnull=True,
             workspace_connection__deleted_at__isnull=True,
             workspace_connection__credential__deleted_at__isnull=True,
         )
+        if project_id:
+            qs = qs.filter(project_id=project_id)
         if mapping_type:
             qs = qs.filter(type=mapping_type)
 
@@ -635,6 +657,7 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
                 "description_html": f"<p>{description}</p>" if description else "<p></p>",
             },
             context={
+                "request": request,
                 "project_id": str(project.id),
                 "workspace_id": str(ws.id),
                 "default_assignee_id": project.default_assignee_id,
@@ -646,8 +669,12 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
 
         # BaseModel.save() looks up the current user via crum and would
         # clobber created_by back to None for silo (anonymous principal).
-        # Use queryset .update() to bypass model save entirely.
-        Issue.objects.filter(pk=serializer.data["id"]).update(created_by_id=actor.id)
+        # Use queryset .update() to bypass model save entirely. Set
+        # updated_by_id too — on a fresh row the creator is also the
+        # initial updater, and the audit columns are expected to agree.
+        Issue.objects.filter(pk=serializer.data["id"]).update(
+            created_by_id=actor.id, updated_by_id=actor.id
+        )
         issue = Issue.objects.get(pk=serializer.data["id"])
 
         # Fire the same activity hook as the public IssueListCreate
@@ -726,7 +753,10 @@ class WorkspaceCredentialDetailEndpoint(BaseAPIView):
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def delete(self, request, slug, pk):
-        WorkspaceCredential.objects.filter(workspace__slug=slug, pk=pk).delete()
+        # Instance-level .delete() so BaseModel's soft-delete logic runs.
+        # QuerySet.delete() would do a hard SQL delete and skip it.
+        cred = get_object_or_404(WorkspaceCredential, workspace__slug=slug, pk=pk)
+        cred.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -778,12 +808,16 @@ class WorkspaceConnectionListCreateEndpoint(BaseAPIView):
 class WorkspaceConnectionDetailEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
     def get(self, request, slug, pk):
-        conn = get_object_or_404(WorkspaceConnection, workspace__slug=slug, pk=pk)
+        conn = get_object_or_404(
+            WorkspaceConnection, workspace__slug=slug, pk=pk, deleted_at__isnull=True
+        )
         return Response(WorkspaceConnectionSerializer(conn).data)
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def patch(self, request, slug, pk):
-        conn = get_object_or_404(WorkspaceConnection, workspace__slug=slug, pk=pk)
+        conn = get_object_or_404(
+            WorkspaceConnection, workspace__slug=slug, pk=pk, deleted_at__isnull=True
+        )
         serializer = WorkspaceConnectionSerializer(conn, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -791,7 +825,9 @@ class WorkspaceConnectionDetailEndpoint(BaseAPIView):
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def delete(self, request, slug, pk):
-        WorkspaceConnection.objects.filter(workspace__slug=slug, pk=pk).delete()
+        # Instance-level .delete() to honour BaseModel's soft-delete.
+        conn = get_object_or_404(WorkspaceConnection, workspace__slug=slug, pk=pk)
+        conn.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -886,5 +922,7 @@ class WorkspaceEntityConnectionDetailEndpoint(BaseAPIView):
 
     @allow_permission(allowed_roles=[ROLE.ADMIN], level="WORKSPACE")
     def delete(self, request, slug, pk):
-        WorkspaceEntityConnection.objects.filter(workspace__slug=slug, pk=pk).delete()
+        # Instance-level .delete() to honour BaseModel's soft-delete.
+        conn = get_object_or_404(WorkspaceEntityConnection, workspace__slug=slug, pk=pk)
+        conn.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

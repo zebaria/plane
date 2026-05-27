@@ -294,17 +294,13 @@ const dispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void>
 };
 
 const fetchSlackTeamIdForWorkspace = async (workspaceSlug: string): Promise<string | null> => {
-  // Ask Django via the silo-only project-mappings endpoint with no
-  // project filter. Cheap + already HMAC-gated.
+  // Ask Django for any live mapping in this workspace; project_id is
+  // optional on the endpoint. Any mapping carries the workspace's Slack
+  // team_id, which is all we need to open a DM.
   const r = await callDjango<{ mappings: ProjectMapping[] }>("POST", "/api/v1/silo/project-mappings/", {
     workspace_slug: workspaceSlug,
-    project_id: "00000000-0000-0000-0000-000000000000",
   });
   if (r.status >= 300) return null;
-  // Empty for the dummy project — we need a different endpoint. For
-  // now, return null and accept that DMs need at least one channel
-  // mapping in the workspace to discover team_id. TODO: a dedicated
-  // workspace-team-id endpoint.
   return r.data.mappings?.[0]?.connection_team_id ?? null;
 };
 

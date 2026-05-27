@@ -166,9 +166,15 @@ def dispatch_silo_work_item_event(
         if not isinstance(ci, dict):
             ci = {}
 
-        # Existence check: is anything bound for this project?
+        # Existence check: is anything live bound for this project?
+        # Walk up to workspace_connection + credential so we don't fan
+        # events out for an integration that's been removed.
         mappings_qs = WorkspaceEntityConnection.objects.filter(
-            project_id=project_id, type=SLACK_NOTIFICATION_TYPE
+            project_id=project_id,
+            type=SLACK_NOTIFICATION_TYPE,
+            deleted_at__isnull=True,
+            workspace_connection__deleted_at__isnull=True,
+            workspace_connection__credential__deleted_at__isnull=True,
         )
         if not mappings_qs.exists():
             return
