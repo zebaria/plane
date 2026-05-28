@@ -9,6 +9,7 @@ from .views import (
     SiloCreateCommentEndpoint,
     SiloCreateWorkItemEndpoint,
     SiloProjectMappingsEndpoint,
+    SiloProjectMetadataEndpoint,
     SiloSlackInstallEndpoint,
     SiloSlackPersistTokensEndpoint,
     SiloSlackTeamContextEndpoint,
@@ -62,6 +63,11 @@ urlpatterns = [
         "silo/comments/",
         SiloCreateCommentEndpoint.as_view(http_method_names=["post"]),
         name="silo-create-comment",
+    ),
+    path(
+        "silo/project-metadata/",
+        SiloProjectMetadataEndpoint.as_view(http_method_names=["post"]),
+        name="silo-project-metadata",
     ),
     path(
         "silo/work-items/lookup/",

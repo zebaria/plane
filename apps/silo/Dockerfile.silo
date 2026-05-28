@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.7
+FROM node:22-alpine AS base
+
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PNPM_HOME/bin:$PATH"
+RUN corepack enable
+
+# *****************************************************************************
+# STAGE 1: Prune the monorepo to silo's slice
+# *****************************************************************************
+FROM base AS builder
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+
+ARG TURBO_VERSION=2.9.4
+RUN corepack enable pnpm && pnpm add -g turbo@${TURBO_VERSION}
+COPY . .
+
+RUN turbo prune --scope=silo --docker
+
+# *****************************************************************************
+# STAGE 2: Install deps and build
+# *****************************************************************************
+FROM base AS installer
+
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+
+COPY .gitignore .gitignore
+COPY --from=builder /app/out/json/ .
+COPY --from=builder /app/out/pnpm-lock.yaml ./pnpm-lock.yaml
+RUN corepack enable pnpm
+
+COPY --from=builder /app/out/full/ .
+COPY turbo.json turbo.json
+
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store pnpm fetch --store-dir=/pnpm/store
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store CI=true pnpm install --offline --frozen-lockfile --store-dir=/pnpm/store
+
+ENV TURBO_TELEMETRY_DISABLED=1
+
+RUN pnpm turbo run build --filter=silo
+
+# *****************************************************************************
+# STAGE 3: Runtime
+# *****************************************************************************
+FROM node:22-alpine AS production
+WORKDIR /app
+
+RUN apk add --no-cache curl
+
+# Copy built artifact + a minimal node_modules. tsdown bundles deps into
+# dist/start.mjs; we still ship node_modules in case any dep is left
+# external (sharp-style native bindings).
+COPY --from=installer /app/apps/silo/dist ./dist
+COPY --from=installer /app/apps/silo/package.json ./package.json
+COPY --from=installer /app/apps/silo/node_modules ./node_modules
+
+ENV NODE_ENV=production
+EXPOSE 3005
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:3005/silo/health >/dev/null || exit 1
+
+CMD ["node", "dist/start.mjs"]

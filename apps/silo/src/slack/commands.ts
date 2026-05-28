@@ -20,6 +20,7 @@ import express from "express";
 import { getSlackConfig } from "../config";
 import { callSlackApiForTeam } from "./api";
 import { buildCreateWorkItemView } from "./modal";
+import { fetchProjectMetadata } from "./project-metadata";
 import { verifySlackSignature } from "./signature";
 import { resolveTeamContext } from "./team-context";
 
@@ -56,6 +57,16 @@ const openCreateWorkItemModal = async (payload: SlashPayload): Promise<void> => 
     return;
   }
 
+  const initialProjectId = ctx.projects[0]?.id ?? null;
+  let projectMeta = null;
+  if (initialProjectId) {
+    try {
+      projectMeta = await fetchProjectMetadata(ctx.workspaceSlug, initialProjectId);
+    } catch (err) {
+      console.warn("[silo] project-metadata fetch failed (degrading to text-only modal):", err);
+    }
+  }
+
   const view = buildCreateWorkItemView(
     ctx.projects,
     {
@@ -64,6 +75,8 @@ const openCreateWorkItemModal = async (payload: SlashPayload): Promise<void> => 
       triggerUserId: userId,
       installerUserId: ctx.installerUserId,
     },
+    initialProjectId,
+    projectMeta,
     text
   );
 

@@ -690,6 +690,117 @@ class SiloWorkItemLookupEndpoint(BaseAPIView):
         )
 
 
+class SiloProjectMetadataEndpoint(BaseAPIView):
+    """Return picker-fillable metadata for a project.
+
+    Powers the Slack create-work-item modal pickers: states, labels,
+    members, work-item types (project-scoped, sorted by their
+    ProjectIssueType level), and the static priority list. Light read
+    — no token data — so callers can hit it on every modal open.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import (
+            Issue,
+            Label,
+            Project,
+            ProjectMember,
+            State,
+        )
+        from plane.db.models.issue_type import ProjectIssueType
+
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        project_id = data.get("project_id")
+        if not (slug and project_id):
+            return Response(
+                {"detail": "workspace_slug and project_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ws = get_object_or_404(Workspace, slug=slug)
+        project = get_object_or_404(Project, pk=project_id, workspace=ws)
+
+        states = list(
+            State.objects.filter(workspace=ws, project=project)
+            .order_by("sequence")
+            .values("id", "name", "group", "color", "default")
+        )
+        default_state_id = next(
+            (str(s["id"]) for s in states if s.get("default")), None
+        )
+
+        labels = list(
+            Label.objects.filter(workspace=ws, project=project)
+            .order_by("sort_order", "name")
+            .values("id", "name", "color")
+        )
+
+        members_qs = (
+            ProjectMember.objects.filter(project=project, is_active=True, member__isnull=False)
+            .select_related("member")
+            .order_by("member__display_name")
+        )
+        members = [
+            {
+                "id": str(m.member_id),
+                "display_name": m.member.display_name or m.member.email,
+            }
+            for m in members_qs
+        ]
+
+        # Surface only the work-item types attached to this project,
+        # in the order configured for the project (level on the join).
+        type_rows = list(
+            ProjectIssueType.objects.filter(project=project, issue_type__is_active=True)
+            .select_related("issue_type")
+            .order_by("level")
+        )
+        types = [
+            {
+                "id": str(r.issue_type_id),
+                "name": r.issue_type.name,
+                "is_default": r.is_default,
+                "is_epic": r.issue_type.is_epic,
+            }
+            for r in type_rows
+        ]
+        default_type_id = next((t["id"] for t in types if t["is_default"]), None)
+
+        priorities = [
+            {"key": k, "label": v} for k, v in Issue.PRIORITY_CHOICES
+        ]
+
+        return Response(
+            {
+                "states": [
+                    {
+                        "id": str(s["id"]),
+                        "name": s["name"],
+                        "group": s["group"],
+                        "color": s["color"],
+                    }
+                    for s in states
+                ],
+                "default_state_id": default_state_id,
+                "labels": [
+                    {"id": str(label["id"]), "name": label["name"], "color": label["color"]}
+                    for label in labels
+                ],
+                "members": members,
+                "default_assignee_id": (
+                    str(project.default_assignee_id) if project.default_assignee_id else None
+                ),
+                "types": types,
+                "default_type_id": default_type_id,
+                "priorities": priorities,
+            }
+        )
+
+
 class SiloCreateWorkItemEndpoint(BaseAPIView):
     """Create a Plane work item on behalf of silo.
 
@@ -715,6 +826,11 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         actor_id = data.get("actor_user_id")
         slack_user_id = data.get("slack_user_id")
         slack_team_id = data.get("slack_team_id")
+        type_id = data.get("type_id") or None
+        state_id = data.get("state_id") or None
+        priority = data.get("priority") or None
+        label_ids = data.get("label_ids") or []
+        assignee_ids = data.get("assignee_ids") or []
 
         if not (slug and project_id and title):
             return Response(
@@ -757,11 +873,26 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Escape so user-typed `<`, `>`, `&` don't get stripped or
+        # mis-parsed by the editor's HTML sanitizer.
+        import html as _html
+        payload = {
+            "name": title[:255],
+            "description_html": f"<p>{_html.escape(description)}</p>" if description else "<p></p>",
+        }
+        if type_id:
+            payload["type_id"] = type_id
+        if state_id:
+            payload["state"] = state_id
+        if priority:
+            payload["priority"] = priority
+        if label_ids:
+            payload["labels"] = label_ids
+        if assignee_ids:
+            payload["assignees"] = assignee_ids
+
         serializer = IssueSerializer(
-            data={
-                "name": title[:255],
-                "description_html": f"<p>{description}</p>" if description else "<p></p>",
-            },
+            data=payload,
             context={
                 "request": request,
                 "project_id": str(project.id),

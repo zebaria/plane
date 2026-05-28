@@ -25,9 +25,22 @@ import { getSlackConfig } from "../config";
 import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
 import { callSlackApiForTeam } from "./api";
-import { CREATE_WORK_ITEM_CALLBACK, type CreateWorkItemMetadata } from "./modal";
+import {
+  CREATE_WORK_ITEM_CALLBACK,
+  PROJECT_SELECT_ACTION,
+  buildCreateWorkItemView,
+  type CreateWorkItemMetadata,
+} from "./modal";
+import { fetchProjectMetadata } from "./project-metadata";
 import { verifySlackSignature } from "./signature";
 import { resolveTeamContext } from "./team-context";
+
+type SlackSelectedOption = { value: string };
+type SlackInputState = {
+  value?: string;
+  selected_option?: SlackSelectedOption;
+  selected_options?: SlackSelectedOption[];
+};
 
 type SlackViewSubmission = {
   type: "view_submission";
@@ -36,7 +49,7 @@ type SlackViewSubmission = {
   view: {
     callback_id: string;
     private_metadata: string;
-    state: { values: Record<string, Record<string, { value?: string; selected_option?: { value: string } }>> };
+    state: { values: Record<string, Record<string, SlackInputState>> };
   };
 };
 
@@ -45,7 +58,19 @@ type SlackBlockActions = {
   team: { id: string };
   user: { id: string };
   trigger_id: string;
-  actions: { action_id: string; value?: string }[];
+  view?: {
+    id: string;
+    hash?: string;
+    callback_id: string;
+    private_metadata: string;
+    state?: { values: Record<string, Record<string, SlackInputState>> };
+  };
+  actions: {
+    action_id: string;
+    block_id?: string;
+    value?: string;
+    selected_option?: SlackSelectedOption;
+  }[];
 };
 
 type ViewSubmitResponse = Record<string, unknown>;
@@ -80,6 +105,11 @@ const handleCreateWorkItem = async (payload: SlackViewSubmission): Promise<ViewS
   const projectId = values.project?.project_id?.selected_option?.value;
   const title = (values.title?.title?.value ?? "").trim();
   const description = (values.description?.description?.value ?? "").trim();
+  const typeId = values.type?.type_id?.selected_option?.value;
+  const stateId = values.state?.state_id?.selected_option?.value;
+  const priority = values.priority?.priority?.selected_option?.value;
+  const labelIds = (values.labels?.label_ids?.selected_options ?? []).map((o) => o.value);
+  const assigneeIds = (values.assignees?.assignee_ids?.selected_options ?? []).map((o) => o.value);
 
   if (!projectId) {
     return errorResponse({ project: "Pick a project" });
@@ -112,6 +142,11 @@ const handleCreateWorkItem = async (payload: SlackViewSubmission): Promise<ViewS
       description,
       slack_user_id: slackUserId,
       slack_team_id: teamId,
+      type_id: typeId,
+      state_id: stateId,
+      priority,
+      label_ids: labelIds,
+      assignee_ids: assigneeIds,
     });
   } catch (err) {
     console.error("[silo] work-item create network error:", err);
@@ -142,6 +177,57 @@ const errorResponse = (errors: Record<string, string>): ViewSubmitResponse => ({
   response_action: "errors",
   errors,
 });
+
+const handleProjectChange = async (payload: SlackBlockActions): Promise<void> => {
+  const teamId = payload.team.id;
+  const view = payload.view;
+  const action = payload.actions?.[0];
+  const newProjectId = action?.selected_option?.value;
+  if (!view || !newProjectId) return;
+
+  let metadata: CreateWorkItemMetadata;
+  try {
+    metadata = JSON.parse(view.private_metadata) as CreateWorkItemMetadata;
+  } catch {
+    console.warn("[silo] project change: bad private_metadata");
+    return;
+  }
+
+  const ctx = await resolveTeamContext(teamId);
+  if (!ctx) return;
+
+  let projectMeta = null;
+  try {
+    projectMeta = await fetchProjectMetadata(ctx.workspaceSlug, newProjectId);
+  } catch (err) {
+    console.warn("[silo] project-metadata fetch on change failed:", err);
+  }
+
+  // Preserve whatever the user has already typed — Slack doesn't
+  // carry input values across views.update unless we re-render them
+  // back into initial_value.
+  const stateValues = view.state?.values;
+  const currentTitle = stateValues?.title?.title?.value ?? metadata.initialText ?? "";
+  const currentDescription = stateValues?.description?.description?.value ?? "";
+
+  const updated = buildCreateWorkItemView(
+    ctx.projects,
+    metadata,
+    newProjectId,
+    projectMeta,
+    currentTitle,
+    currentDescription
+  );
+
+  const result = await callSlackApiForTeam("views.update", teamId, {
+    view_id: view.id,
+    hash: view.hash,
+    view: updated,
+  });
+  if (!result || !result.ok) {
+    console.error(`[silo] views.update on project change failed: ${result?.error ?? "no-team-context"}`);
+  }
+};
 
 const handleReplyButton = async (payload: SlackBlockActions): Promise<void> => {
   const teamId = payload.team.id;
@@ -298,6 +384,13 @@ export const slackInteractionsRouter = (): Router => {
         if (payload.type === "block_actions") {
           const ba = payload as SlackBlockActions;
           const action = ba.actions?.[0];
+          if (action?.action_id === PROJECT_SELECT_ACTION) {
+            res.status(200).end();
+            handleProjectChange(ba).catch((err) => {
+              console.error("[silo] project change handler crashed:", err);
+            });
+            return;
+          }
           if (action?.action_id === "plane_reply_comment") {
             // Ack first, do work async (views.open is fast but we
             // stay consistent with the slash command pattern).

@@ -82,6 +82,9 @@ jobs:
           - image: plane-proxy
             context: ./apps/proxy
             dockerfile: ./apps/proxy/Dockerfile.ce
+          - image: plane-silo
+            context: .
+            dockerfile: ./apps/silo/Dockerfile.silo
     env:
       ROLE_ARN: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/gh-actions-zebaria-plane
     steps:
