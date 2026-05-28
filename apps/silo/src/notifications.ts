@@ -341,7 +341,7 @@ export const notificationsRouter = (): Router => {
     }
 
     console.log(
-      `[silo] notifications event_type=${event.event_type ?? "?"} project=${event.project_id ?? "?"} issue=${event.issue_id ?? "?"}`
+      `[silo] notifications event_type=${event.event_type ?? "?"} project=${event.project_id ?? "?"} issue=${event.issue?.id ?? "?"}`
     );
 
     // Ack immediately; do work async.
