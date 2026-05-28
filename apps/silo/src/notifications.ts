@@ -158,30 +158,47 @@ const buildBlocks = (event: WorkItemEvent, webBaseUrl: string): Record<string, u
       type: "section",
       text: { type: "mrkdwn", text: `> ${trimmed.replace(/\n/g, "\n> ")}` },
     });
-    blocks.push({
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Reply" },
-          action_id: "plane_reply_comment",
-          value: JSON.stringify({
-            workspace_slug: event.workspace_slug,
-            project_id: event.project_id,
-            issue_id: issue.id,
-            project_identifier: event.project_identifier,
-            sequence_id: issue.sequence_id,
-            issue_name: issue.name,
-          }),
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "View in Plane" },
-          url,
-        },
-      ],
+  }
+
+  // Action row on every event. Reply only makes sense for the commented
+  // path, but Assign-me / View-in-Plane apply to all of them. Embedding
+  // the work-item ref in the button value avoids a Django round-trip in
+  // the action handler.
+  const actionContext = JSON.stringify({
+    workspace_slug: event.workspace_slug,
+    project_id: event.project_id,
+    issue_id: issue.id,
+    project_identifier: event.project_identifier,
+    sequence_id: issue.sequence_id,
+    issue_name: issue.name,
+  });
+  const actionElements: Record<string, unknown>[] = [];
+  if (event.event_type === "work_item.commented") {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "Reply" },
+      action_id: "plane_reply_comment",
+      value: actionContext,
     });
   }
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "Assign me" },
+    action_id: "plane_assign_me",
+    value: actionContext,
+  });
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "Change state" },
+    action_id: "plane_change_state",
+    value: actionContext,
+  });
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "View in Plane" },
+    url,
+  });
+  blocks.push({ type: "actions", elements: actionElements });
 
   const ctx: string[] = [];
   if (issue.state_name) ctx.push(issue.state_name);

@@ -1036,6 +1036,245 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         )
 
 
+class SiloAddAssigneeEndpoint(BaseAPIView):
+    """Add the resolved Slack→Plane user as an assignee on a work item.
+
+    Powers the "Assign me" button on Slack notification cards. Same
+    actor-resolution rules as SiloCreateWorkItemEndpoint; the resolved
+    user is the assignee being added (silo notification cards always
+    self-assign — there's no separate "assign someone else" form).
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import Issue, IssueAssignee, Project, ProjectMember, User
+
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        project_id = data.get("project_id")
+        issue_id = data.get("issue_id")
+        actor_id = data.get("actor_user_id")
+        slack_user_id = data.get("slack_user_id")
+        slack_team_id = data.get("slack_team_id")
+
+        if not (slug and project_id and issue_id):
+            return Response(
+                {"detail": "workspace_slug, project_id, issue_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ws = get_object_or_404(Workspace, slug=slug)
+        project = get_object_or_404(Project, pk=project_id, workspace=ws)
+        issue = get_object_or_404(Issue, pk=issue_id, project=project)
+
+        actor = None
+        if actor_id:
+            actor = User.objects.filter(pk=actor_id).first()
+        if not actor and slack_user_id:
+            uc = (
+                WorkspaceUserConnection.objects.filter(
+                    workspace=ws,
+                    connection_type="slack",
+                    connection_id=slack_user_id,
+                )
+                .select_related("user")
+                .first()
+            )
+            if uc:
+                actor = uc.user
+        if not actor:
+            return Response(
+                {"detail": "no Plane account linked for this Slack user"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Membership gate: assignees must be active project members
+        # with role >= 15 (member). Same rule the issue serializer
+        # enforces; centralize here so the activity log doesn't show
+        # a "assigned" entry for a user who isn't actually on the
+        # project.
+        is_member = ProjectMember.objects.filter(
+            project_id=project.id,
+            member_id=actor.id,
+            role__gte=15,
+            is_active=True,
+        ).exists()
+        if not is_member:
+            return Response(
+                {"detail": "not a project member"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Capture the pre-state for the activity log so the
+        # "assigned" entry shows the diff (old → new assignee_ids).
+        prev_assignee_ids = list(
+            IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
+        )
+        if actor.id in prev_assignee_ids:
+            return Response(
+                {"id": str(issue.id), "already_assigned": True},
+                status=status.HTTP_200_OK,
+            )
+
+        IssueAssignee.objects.create(
+            assignee_id=actor.id,
+            issue=issue,
+            project_id=project.id,
+            workspace_id=ws.id,
+            created_by_id=actor.id,
+            updated_by_id=actor.id,
+        )
+
+        # Mirror IssueViewSet.partial_update's activity payload shape:
+        # current_instance carries the old assignee_ids; requested_data
+        # carries the new full set.
+        from plane.bgtasks.issue_activities_task import issue_activity
+        import json as _json
+        from django.utils import timezone as _tz
+
+        try:
+            issue_activity.delay(
+                type="issue.activity.updated",
+                requested_data=_json.dumps(
+                    {"assignee_ids": [str(uid) for uid in prev_assignee_ids + [actor.id]]}
+                ),
+                actor_id=str(actor.id),
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                current_instance=_json.dumps(
+                    {"assignee_ids": [str(uid) for uid in prev_assignee_ids]}
+                ),
+                epoch=int(_tz.now().timestamp()),
+                notification=True,
+            )
+        except Exception:
+            pass
+
+        return Response({"id": str(issue.id), "assigned": True}, status=status.HTTP_200_OK)
+
+
+class SiloChangeStateEndpoint(BaseAPIView):
+    """Move a work item to a new state.
+
+    Powers the "Change state" button on Slack notification cards.
+    Same actor-resolution rules as SiloCreateWorkItemEndpoint. The
+    new state must belong to the same project. Idempotent — no-op
+    when the issue is already in the requested state.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import Issue, Project, State, User
+
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        project_id = data.get("project_id")
+        issue_id = data.get("issue_id")
+        state_id = data.get("state_id")
+        actor_id = data.get("actor_user_id")
+        slack_user_id = data.get("slack_user_id")
+        slack_team_id = data.get("slack_team_id")
+
+        if not (slug and project_id and issue_id and state_id):
+            return Response(
+                {"detail": "workspace_slug, project_id, issue_id, state_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ws = get_object_or_404(Workspace, slug=slug)
+        project = get_object_or_404(Project, pk=project_id, workspace=ws)
+        issue = get_object_or_404(Issue, pk=issue_id, project=project)
+        new_state = State.objects.filter(pk=state_id, project=project).first()
+        if not new_state:
+            return Response(
+                {"detail": "state_id is not from this project"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        actor = None
+        if actor_id:
+            actor = User.objects.filter(pk=actor_id).first()
+        if not actor and slack_user_id:
+            uc = (
+                WorkspaceUserConnection.objects.filter(
+                    workspace=ws,
+                    connection_type="slack",
+                    connection_id=slack_user_id,
+                )
+                .select_related("user")
+                .first()
+            )
+            if uc:
+                actor = uc.user
+        if not actor and slack_team_id:
+            cred = WorkspaceCredential.objects.filter(
+                workspace=ws, source="slack", source_identifier=slack_team_id
+            ).first()
+            if cred:
+                actor = cred.user
+        if not actor:
+            return Response(
+                {"detail": "could not resolve actor"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        prev_state_id = issue.state_id
+        if prev_state_id == new_state.id:
+            return Response({"id": str(issue.id), "unchanged": True}, status=status.HTTP_200_OK)
+
+        # Going through issue.save() (not .update()) so the model's
+        # _sync_completed_at hook fires when transitioning to/from
+        # completed states. Override the crum thread-local user for
+        # the save so updated_by gets the resolved actor instead of
+        # silo's anonymous HMAC principal; restore in finally so we
+        # never leak crum state across requests on the same worker.
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        prev_request_user = request.user
+        set_current_user(actor)
+        request.user = actor
+        try:
+            issue.state = new_state
+            issue.save()
+        finally:
+            set_current_user(prev_user)
+            request.user = prev_request_user
+
+        from plane.bgtasks.issue_activities_task import issue_activity
+        import json as _json
+        from django.utils import timezone as _tz
+
+        try:
+            issue_activity.delay(
+                type="issue.activity.updated",
+                requested_data=_json.dumps({"state_id": str(new_state.id)}),
+                actor_id=str(actor.id),
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                current_instance=_json.dumps(
+                    {"state_id": str(prev_state_id) if prev_state_id else None}
+                ),
+                epoch=int(_tz.now().timestamp()),
+                notification=True,
+            )
+        except Exception:
+            pass
+
+        return Response(
+            {
+                "id": str(issue.id),
+                "state_id": str(new_state.id),
+                "state_name": new_state.name,
+                "state_group": new_state.group,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 # -- credentials -----------------------------------------------------------
 
 
