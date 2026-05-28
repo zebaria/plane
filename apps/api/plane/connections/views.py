@@ -823,6 +823,7 @@ class SiloProjectMetadataEndpoint(BaseAPIView):
                 "types": types,
                 "default_type_id": default_type_id,
                 "priorities": priorities,
+                "intake_enabled": bool(project.intake_view),
             }
         )
 
@@ -857,6 +858,7 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         priority = data.get("priority") or None
         label_ids = data.get("label_ids") or []
         assignee_ids = data.get("assignee_ids") or []
+        as_intake = bool(data.get("as_intake"))
 
         if not (slug and project_id and title):
             return Response(
@@ -866,6 +868,12 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
 
         ws = get_object_or_404(Workspace, slug=slug)
         project = get_object_or_404(Project, pk=project_id, workspace=ws)
+
+        if as_intake and not project.intake_view:
+            return Response(
+                {"detail": "Intake is not enabled for this project"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Actor resolution priority:
         #   1. Explicit actor_user_id (caller-specified Plane user).
@@ -908,14 +916,35 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         }
         if type_id:
             payload["type_id"] = type_id
-        if state_id:
-            payload["state"] = state_id
         if priority:
             payload["priority"] = priority
         if label_ids:
             payload["labels"] = label_ids
         if assignee_ids:
             payload["assignees"] = assignee_ids
+
+        # Intake submissions land in a triage state and are tracked via
+        # IntakeIssue. Resolve (or create) the triage state up-front;
+        # the api IssueSerializer's state validator excludes triage
+        # states, so we don't pass it through the serializer — we
+        # update issue.state after save.
+        from plane.db.models import State, StateGroup, Intake, IntakeIssue
+        from plane.db.models.intake import SourceType
+        triage_state = None
+        if as_intake:
+            triage_state = State.triage_objects.filter(project_id=project.id, workspace=ws).first()
+            if not triage_state:
+                triage_state = State.objects.create(
+                    name="Triage",
+                    group=StateGroup.TRIAGE.value,
+                    project_id=project.id,
+                    workspace_id=ws.id,
+                    color="#4E5355",
+                    sequence=65000,
+                    default=False,
+                )
+        elif state_id:
+            payload["state"] = state_id
 
         serializer = IssueSerializer(
             data=payload,
@@ -947,6 +976,28 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
             request.user = prev_request_user
         issue = serializer.instance
 
+        # For intake submissions: park the issue in the triage state
+        # (the api IssueSerializer rejects triage states via its state
+        # validator, so we set it post-save) and create the IntakeIssue
+        # row pointing at the project's default Intake.
+        intake_issue = None
+        if as_intake and triage_state is not None:
+            Issue.objects.filter(pk=issue.pk).update(state_id=triage_state.id)
+            issue.state_id = triage_state.id
+            intake = Intake.objects.filter(project=project, is_default=True).first()
+            if not intake:
+                intake = Intake.objects.create(
+                    name=f"{project.name} Intake",
+                    project=project,
+                    is_default=True,
+                )
+            intake_issue = IntakeIssue.objects.create(
+                intake_id=intake.id,
+                project_id=project.id,
+                issue_id=issue.id,
+                source=SourceType.IN_APP,
+            )
+
         # Fire the same activity hook as the public IssueListCreate
         # endpoint so downstream listeners (the silo Slack-notification
         # fan-out, in particular) see the create event.
@@ -965,6 +1016,7 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
                 project_id=str(project.id),
                 current_instance=None,
                 epoch=int(_tz.now().timestamp()),
+                intake=str(intake_issue.id) if intake_issue else None,
             )
         except Exception:
             # Best-effort — activity logging failure shouldn't fail the

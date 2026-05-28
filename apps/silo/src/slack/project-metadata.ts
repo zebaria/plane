@@ -27,6 +27,7 @@ export type ProjectMetadata = {
   types: ProjectType[];
   defaultTypeId: string | null;
   priorities: ProjectPriority[];
+  intakeEnabled: boolean;
 };
 
 const CACHE_TTL_MS = 60_000;
@@ -53,6 +54,7 @@ export const fetchProjectMetadata = async (workspaceSlug: string, projectId: str
     types: ProjectType[];
     default_type_id: string | null;
     priorities: ProjectPriority[];
+    intake_enabled?: boolean;
   }>("POST", "/api/v1/silo/project-metadata/", {
     workspace_slug: workspaceSlug,
     project_id: projectId,
@@ -71,6 +73,7 @@ export const fetchProjectMetadata = async (workspaceSlug: string, projectId: str
     types: res.data.types ?? [],
     defaultTypeId: res.data.default_type_id ?? null,
     priorities: res.data.priorities ?? [],
+    intakeEnabled: res.data.intake_enabled ?? false,
   };
   if (cache.size >= CACHE_MAX_ENTRIES) {
     const oldest = cache.keys().next().value;

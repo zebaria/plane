@@ -139,6 +139,7 @@ const handleCreateWorkItem = async (payload: SlackViewSubmission): Promise<ViewS
   const priority = values.priority?.priority?.selected_option?.value;
   const labelIds = (values.labels?.label_ids?.selected_options ?? []).map((o) => o.value);
   const assigneeIds = (values.assignees?.assignee_ids?.selected_options ?? []).map((o) => o.value);
+  const asIntake = (values.as_intake?.as_intake?.selected_options ?? []).length > 0;
 
   if (!projectId) {
     return errorResponse({ project: "Pick a project" });
@@ -176,6 +177,7 @@ const handleCreateWorkItem = async (payload: SlackViewSubmission): Promise<ViewS
       priority,
       label_ids: labelIds,
       assignee_ids: assigneeIds,
+      as_intake: asIntake,
     });
   } catch (err) {
     console.error("[silo] work-item create network error:", err);
@@ -194,7 +196,7 @@ const handleCreateWorkItem = async (payload: SlackViewSubmission): Promise<ViewS
   void callSlackApiForTeam("chat.postEphemeral", teamId, {
     channel: metadata.channelId,
     user: slackUserId,
-    text: `Created *${issueLabel}* — ${issue.name}`,
+    text: asIntake ? `Created *${issueLabel}* in Intake — ${issue.name}` : `Created *${issueLabel}* — ${issue.name}`,
   }).catch((err) => {
     console.error("[silo] postEphemeral failed:", err);
   });

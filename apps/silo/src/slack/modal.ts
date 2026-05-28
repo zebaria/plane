@@ -216,6 +216,33 @@ export const buildCreateWorkItemView = (
     ]) {
       if (block) blocks.push(block);
     }
+
+    // "Add as Intake" — when checked, the work item lands in the
+    // project's Intake queue (triage state) instead of the main board.
+    // Caller-supplied state is ignored server-side for intake items.
+    // Only render if the project has Intake enabled; otherwise the
+    // toggle would create a stray Intake the user never opted into.
+    if (projectMeta.intakeEnabled)
+      blocks.push({
+        type: "input",
+        block_id: "as_intake",
+        optional: true,
+        label: { type: "plain_text", text: " " },
+        element: {
+          type: "checkboxes",
+          action_id: "as_intake",
+          options: [
+            {
+              text: { type: "plain_text", text: "Add as Intake" },
+              description: {
+                type: "plain_text",
+                text: "Send to the project's Intake queue for triage instead of the main board.",
+              },
+              value: "1",
+            },
+          ],
+        },
+      });
   }
 
   return {
