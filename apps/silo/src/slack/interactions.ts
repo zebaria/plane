@@ -18,6 +18,7 @@
  * `response_action: "clear"` ack + async post via chat.postMessage.
  */
 
+import axios from "axios";
 import type { Request, Response, Router } from "express";
 import express from "express";
 
@@ -34,6 +35,7 @@ import {
 import { fetchProjectMetadata } from "./project-metadata";
 import { verifySlackSignature } from "./signature";
 import { resolveTeamContext } from "./team-context";
+import { lookupWorkItem, parseWorkItemRef } from "./work-items";
 
 type SlackSelectedOption = { value: string };
 type SlackInputState = {
@@ -73,9 +75,36 @@ type SlackBlockActions = {
   }[];
 };
 
+type SlackMessageShortcut = {
+  type: "message_action";
+  callback_id: string;
+  trigger_id: string;
+  team: { id: string };
+  user: { id: string };
+  channel: { id: string; name?: string };
+  message: {
+    ts: string;
+    text?: string;
+    user?: string;
+    [k: string]: unknown;
+  };
+  message_ts?: string;
+  response_url?: string;
+};
+
 type ViewSubmitResponse = Record<string, unknown>;
 
 const REPLY_COMMENT_CALLBACK = "plane_reply_comment_modal";
+
+// Slack-app-side shortcut callback_ids — must match what's configured
+// in the Slack app's Interactivity → Shortcuts → "On messages" list.
+const CREATE_FROM_MESSAGE_CALLBACK = "plane_create_from_message";
+const LINK_TO_MESSAGE_CALLBACK = "plane_link_to_message";
+
+// Modal callback_id for the "Link existing work item to this message"
+// view. The shortcut opens the modal; submission posts a comment with
+// the Slack permalink onto the resolved work item.
+const LINK_TO_MESSAGE_VIEW_CALLBACK = "plane_link_to_message_modal";
 
 // HTML-entity-style escape; same form Slack mrkdwn expects for `<`, `>`, `&`
 // and what HTML requires for embedded text in `<p>...</p>`.
@@ -326,6 +355,260 @@ const handleReplyCommentSubmit = async (payload: SlackViewSubmission): Promise<V
   return {};
 };
 
+type LinkToMessageMetadata = {
+  workspace_slug: string;
+  channel_id: string;
+  message_ts: string;
+  message_excerpt: string;
+};
+
+const fetchPermalink = async (teamId: string, channelId: string, messageTs: string): Promise<string | null> => {
+  // chat.getPermalink is one of Slack's GET-style methods — it
+  // doesn't accept application/json bodies and rejects them with
+  // `invalid_arguments`. Use GET with query params instead, signed
+  // with the team's bot token.
+  try {
+    const ctx = await resolveTeamContext(teamId);
+    if (!ctx) return null;
+    const url = `https://slack.com/api/chat.getPermalink?channel=${encodeURIComponent(channelId)}&message_ts=${encodeURIComponent(messageTs)}`;
+    const res = await axios.get<{ ok: boolean; permalink?: string; error?: string }>(url, {
+      headers: { Authorization: `Bearer ${ctx.botToken}` },
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+    if (!res.data?.ok || !res.data.permalink) {
+      console.warn(`[silo] chat.getPermalink failed: ${res.data?.error ?? "unknown"}`);
+      return null;
+    }
+    return res.data.permalink;
+  } catch (err) {
+    console.warn("[silo] chat.getPermalink network error:", (err as Error).message);
+    return null;
+  }
+};
+
+const handleCreateFromMessage = async (payload: SlackMessageShortcut): Promise<void> => {
+  const teamId = payload.team.id;
+  const triggerId = payload.trigger_id;
+  const channelId = payload.channel.id;
+  const userId = payload.user.id;
+  const messageText = (payload.message.text ?? "").trim();
+  const messageTs = payload.message.ts;
+
+  const ctx = await resolveTeamContext(teamId);
+  if (!ctx) {
+    console.warn(`[silo] create-from-message: no team context for ${teamId}`);
+    return;
+  }
+
+  // First non-empty line becomes the title (Slack messages are
+  // free-form; full message goes in the description with a permalink
+  // back to the source).
+  const titleSeed =
+    messageText
+      .split("\n")
+      .map((l) => l.trim())
+      .find((l) => l.length > 0) ?? "";
+
+  const permalink = await fetchPermalink(teamId, channelId, messageTs);
+  const descriptionParts = [messageText];
+  if (permalink) {
+    descriptionParts.push("", `From Slack: ${permalink}`);
+  }
+  const initialDescription = descriptionParts.join("\n");
+
+  const initialProjectId = ctx.projects[0]?.id ?? null;
+  let projectMeta = null;
+  if (initialProjectId) {
+    try {
+      projectMeta = await fetchProjectMetadata(ctx.workspaceSlug, initialProjectId);
+    } catch (err) {
+      console.warn("[silo] project-metadata fetch in shortcut failed:", err);
+    }
+  }
+
+  const view = buildCreateWorkItemView(
+    ctx.projects,
+    {
+      workspaceSlug: ctx.workspaceSlug,
+      channelId,
+      triggerUserId: userId,
+      installerUserId: ctx.installerUserId,
+      initialText: titleSeed,
+    },
+    initialProjectId,
+    projectMeta,
+    titleSeed,
+    initialDescription
+  );
+
+  const result = await callSlackApiForTeam("views.open", teamId, {
+    trigger_id: triggerId,
+    view,
+  });
+  if (!result || !result.ok) {
+    console.error(`[silo] create-from-message views.open failed: ${result?.error ?? "no-team-context"}`);
+  }
+};
+
+const buildLinkToMessageView = (metadata: LinkToMessageMetadata): Record<string, unknown> => ({
+  type: "modal",
+  callback_id: LINK_TO_MESSAGE_VIEW_CALLBACK,
+  private_metadata: JSON.stringify(metadata),
+  title: { type: "plain_text", text: "Link work item" },
+  submit: { type: "plain_text", text: "Link" },
+  close: { type: "plain_text", text: "Cancel" },
+  blocks: [
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: `Linking message: _${slackEscape(metadata.message_excerpt)}_`,
+        },
+      ],
+    },
+    {
+      type: "input",
+      block_id: "ref",
+      label: { type: "plain_text", text: "Work item" },
+      hint: { type: "plain_text", text: "Format: WZ-1234" },
+      element: {
+        type: "plain_text_input",
+        action_id: "ref",
+        placeholder: { type: "plain_text", text: "WZ-1234" },
+        max_length: 64,
+      },
+    },
+    {
+      type: "input",
+      block_id: "note",
+      optional: true,
+      label: { type: "plain_text", text: "Note" },
+      hint: {
+        type: "plain_text",
+        text: "Optional note prepended to the comment posted on the work item.",
+      },
+      element: {
+        type: "plain_text_input",
+        action_id: "note",
+        multiline: true,
+      },
+    },
+  ],
+});
+
+const handleLinkToMessage = async (payload: SlackMessageShortcut): Promise<void> => {
+  const teamId = payload.team.id;
+  const triggerId = payload.trigger_id;
+  const channelId = payload.channel.id;
+  const messageTs = payload.message.ts;
+
+  const ctx = await resolveTeamContext(teamId);
+  if (!ctx) {
+    console.warn(`[silo] link-to-message: no team context for ${teamId}`);
+    return;
+  }
+
+  const excerpt = (payload.message.text ?? "").replace(/\s+/g, " ").trim().slice(0, 140);
+
+  const metadata: LinkToMessageMetadata = {
+    workspace_slug: ctx.workspaceSlug,
+    channel_id: channelId,
+    message_ts: messageTs,
+    message_excerpt: excerpt || "(no text)",
+  };
+
+  const result = await callSlackApiForTeam("views.open", teamId, {
+    trigger_id: triggerId,
+    view: buildLinkToMessageView(metadata),
+  });
+  if (!result || !result.ok) {
+    console.error(`[silo] link-to-message views.open failed: ${result?.error ?? "no-team-context"}`);
+  }
+};
+
+const handleLinkToMessageSubmit = async (payload: SlackViewSubmission): Promise<ViewSubmitResponse> => {
+  const teamId = payload.team.id;
+  const slackUserId = payload.user.id;
+
+  let metadata: LinkToMessageMetadata;
+  try {
+    metadata = JSON.parse(payload.view.private_metadata) as LinkToMessageMetadata;
+  } catch {
+    return errorResponse({ ref: "Modal metadata corrupt — try again" });
+  }
+
+  const values = payload.view.state.values;
+  const ref = (values.ref?.ref?.value ?? "").trim();
+  const note = (values.note?.note?.value ?? "").trim();
+
+  const parsed = parseWorkItemRef(ref, metadata.workspace_slug);
+  if (!parsed) {
+    return errorResponse({ ref: "Use IDENT-NUMBER (e.g. WZ-1234)" });
+  }
+
+  let item;
+  try {
+    item = await lookupWorkItem(parsed);
+  } catch (err) {
+    console.error("[silo] link-to-message work-item lookup network error:", err);
+    return errorResponse({ ref: "Could not reach Plane — try again" });
+  }
+  if (!item) {
+    return errorResponse({ ref: `No work item found matching ${ref}` });
+  }
+
+  const permalink = await fetchPermalink(teamId, metadata.channel_id, metadata.message_ts);
+
+  // chat.getPermalink can occasionally fail (deleted message, archived
+  // channel, bot lacks channel scope). Without a permalink the comment
+  // is just a note — keep going rather than blocking the link.
+  const lines: string[] = [];
+  if (note) lines.push(slackEscape(note));
+  if (permalink) {
+    lines.push(`From Slack: <a href="${permalink}">${permalink}</a>`);
+  } else {
+    lines.push("From Slack (permalink unavailable)");
+  }
+  if (metadata.message_excerpt) {
+    lines.push(`<em>${slackEscape(metadata.message_excerpt)}</em>`);
+  }
+  const commentHtml = lines.map((l) => `<p>${l}</p>`).join("");
+
+  let r;
+  try {
+    r = await callDjango<{ id: string }>("POST", "/api/v1/silo/comments/", {
+      workspace_slug: item.workspace_slug,
+      project_id: item.project_id,
+      issue_id: item.id,
+      comment_html: commentHtml,
+      slack_user_id: slackUserId,
+      slack_team_id: teamId,
+    });
+  } catch (err) {
+    console.error("[silo] link-to-message comment create network error:", err);
+    return errorResponse({ ref: "Could not reach Plane — try again" });
+  }
+
+  if (r.status >= 300) {
+    console.error(`[silo] link-to-message comment create failed: ${r.status} ${JSON.stringify(r.data)}`);
+    return errorResponse({ ref: `Plane rejected the request (${r.status})` });
+  }
+
+  // Confirm in the source channel so the linker (and others on the
+  // thread) can see the work item. Ephemeral so we don't add noise.
+  void callSlackApiForTeam("chat.postEphemeral", teamId, {
+    channel: metadata.channel_id,
+    user: slackUserId,
+    text: `Linked this message to *${item.project_identifier}-${item.sequence_id}: ${item.name}*`,
+  }).catch((err) => {
+    console.error("[silo] link-to-message postEphemeral failed:", err);
+  });
+
+  return {};
+};
+
 export const slackInteractionsRouter = (): Router => {
   const r = express.Router();
 
@@ -378,6 +661,28 @@ export const slackInteractionsRouter = (): Router => {
           if (view?.callback_id === REPLY_COMMENT_CALLBACK) {
             const out = await handleReplyCommentSubmit(payload as SlackViewSubmission);
             res.status(200).json(out);
+            return;
+          }
+          if (view?.callback_id === LINK_TO_MESSAGE_VIEW_CALLBACK) {
+            const out = await handleLinkToMessageSubmit(payload as SlackViewSubmission);
+            res.status(200).json(out);
+            return;
+          }
+        }
+        if (payload.type === "message_action") {
+          const ms = payload as unknown as SlackMessageShortcut;
+          if (ms.callback_id === CREATE_FROM_MESSAGE_CALLBACK) {
+            res.status(200).end();
+            handleCreateFromMessage(ms).catch((err) => {
+              console.error("[silo] create-from-message handler crashed:", err);
+            });
+            return;
+          }
+          if (ms.callback_id === LINK_TO_MESSAGE_CALLBACK) {
+            res.status(200).end();
+            handleLinkToMessage(ms).catch((err) => {
+              console.error("[silo] link-to-message handler crashed:", err);
+            });
             return;
           }
         }
