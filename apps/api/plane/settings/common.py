@@ -319,6 +319,17 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_ACCEPT_CONTENT = ["application/json"]
 
+# RabbitMQ 4.x rejects transient non-exclusive queues by default. Celery's
+# remote-control mailbox (pidbox) and the mingle/gossip startup probes both
+# rely on them, which crash-loops the worker on boot. We don't use celery
+# inspect / remote control or multi-worker coordination, so disable them.
+# Mingle/gossip are also disabled at the CLI in compose, but setting them
+# here makes the config self-contained and survives a future change of how
+# the worker is invoked.
+CELERY_WORKER_ENABLE_REMOTE_CONTROL = False
+CELERY_WORKER_DISABLE_RATE_LIMITS = True
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
 # In host-mode local dev there's no celery worker process running, so
 # .delay() calls would hang in the queue forever. CELERY_TASK_ALWAYS_EAGER=True
 # in apps/api/.env runs them synchronously instead. Production stays
