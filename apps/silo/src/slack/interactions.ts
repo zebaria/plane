@@ -60,6 +60,8 @@ type SlackBlockActions = {
   team: { id: string };
   user: { id: string };
   trigger_id: string;
+  channel?: { id: string; name?: string };
+  response_url?: string;
   view?: {
     id: string;
     hash?: string;
@@ -95,6 +97,7 @@ type SlackMessageShortcut = {
 type ViewSubmitResponse = Record<string, unknown>;
 
 const REPLY_COMMENT_CALLBACK = "plane_reply_comment_modal";
+const CHANGE_STATE_CALLBACK = "plane_change_state_modal";
 
 // Slack-app-side shortcut callback_ids — must match what's configured
 // in the Slack app's Interactivity → Shortcuts → "On messages" list.
@@ -311,6 +314,205 @@ const handleReplyButton = async (payload: SlackBlockActions): Promise<void> => {
   if (!result || !result.ok) {
     console.error(`[silo] reply views.open failed: ${result?.error ?? "no-team-context"}`);
   }
+};
+
+const handleAssignMe = async (payload: SlackBlockActions): Promise<void> => {
+  const teamId = payload.team.id;
+  const slackUserId = payload.user.id;
+  const action = payload.actions[0];
+  if (!action || !action.value) return;
+
+  let metadata: ReplyCommentMetadata;
+  try {
+    metadata = JSON.parse(action.value) as ReplyCommentMetadata;
+  } catch {
+    console.warn("[silo] assign-me: bad metadata", action.value);
+    return;
+  }
+
+  let r;
+  try {
+    r = await callDjango<{ id: string; assigned?: boolean; already_assigned?: boolean }>(
+      "POST",
+      "/api/v1/silo/work-items/assignees/",
+      {
+        workspace_slug: metadata.workspace_slug,
+        project_id: metadata.project_id,
+        issue_id: metadata.issue_id,
+        slack_user_id: slackUserId,
+        slack_team_id: teamId,
+      }
+    );
+  } catch (err) {
+    console.error("[silo] assign-me network error:", err);
+    return;
+  }
+
+  // Ephemeral feedback — only the clicker sees it. Channel id comes
+  // from the original message context; container.channel_id is on
+  // payload but typed loosely, so fall back to payload.channel.
+  const channelId = payload.channel?.id;
+  if (!channelId) {
+    console.warn("[silo] assign-me: no channel in payload");
+    return;
+  }
+  const ref = `${metadata.project_identifier}-${metadata.sequence_id}`;
+  let text: string;
+  if (r.status === 400 && (r.data as { detail?: string })?.detail?.includes("no Plane account")) {
+    text = `Can't assign — your Slack account isn't linked to a Plane user. Run \`/lplane connect\` first.`;
+  } else if (r.status === 403) {
+    text = `Can't assign — you're not a member of this project.`;
+  } else if (r.status >= 300) {
+    text = `Plane rejected the assign (${r.status}).`;
+  } else if (r.data?.already_assigned) {
+    text = `You're already assigned to *${ref}*.`;
+  } else {
+    text = `Assigned you to *${ref}*.`;
+  }
+  void callSlackApiForTeam("chat.postEphemeral", teamId, {
+    channel: channelId,
+    user: slackUserId,
+    text,
+  }).catch((err) => {
+    console.error("[silo] assign-me postEphemeral failed:", err);
+  });
+};
+
+const truncate = (s: string, n: number): string => (s.length > n ? s.slice(0, n) : s);
+
+const handleChangeStateButton = async (payload: SlackBlockActions): Promise<void> => {
+  const teamId = payload.team.id;
+  const triggerId = payload.trigger_id;
+  const action = payload.actions[0];
+  if (!action || !action.value) return;
+
+  let metadata: ReplyCommentMetadata;
+  try {
+    metadata = JSON.parse(action.value) as ReplyCommentMetadata;
+  } catch {
+    console.warn("[silo] change-state: bad metadata", action.value);
+    return;
+  }
+
+  // Reuse the project-metadata endpoint — it already returns the
+  // project's states with their groups and the project's default
+  // state. The 60s cache is fine here.
+  let meta;
+  try {
+    meta = await fetchProjectMetadata(metadata.workspace_slug, metadata.project_id);
+  } catch (err) {
+    console.error("[silo] change-state: project-metadata fetch failed", err);
+    return;
+  }
+  if (meta.states.length === 0) {
+    console.warn("[silo] change-state: project has no states");
+    return;
+  }
+
+  const options = meta.states.map((s) => ({
+    text: { type: "plain_text", text: truncate(`${s.name} [${s.group}]`, 75) },
+    value: s.id,
+  }));
+
+  const view = {
+    type: "modal",
+    callback_id: CHANGE_STATE_CALLBACK,
+    private_metadata: JSON.stringify({ ...metadata, channel_id: payload.channel?.id ?? null }),
+    title: { type: "plain_text", text: "Change state" },
+    submit: { type: "plain_text", text: "Update" },
+    close: { type: "plain_text", text: "Cancel" },
+    blocks: [
+      {
+        type: "context",
+        elements: [
+          {
+            type: "mrkdwn",
+            text: `Move *${slackEscape(metadata.project_identifier)}-${metadata.sequence_id}: ${slackEscape(metadata.issue_name)}*`,
+          },
+        ],
+      },
+      {
+        type: "input",
+        block_id: "state",
+        label: { type: "plain_text", text: "New state" },
+        element: {
+          type: "static_select",
+          action_id: "state_id",
+          options,
+          initial_option: options[0],
+        },
+      },
+    ],
+  };
+
+  const result = await callSlackApiForTeam("views.open", teamId, {
+    trigger_id: triggerId,
+    view,
+  });
+  if (!result || !result.ok) {
+    console.error(`[silo] change-state views.open failed: ${result?.error ?? "no-team-context"}`);
+  }
+};
+
+type ChangeStateMetadata = ReplyCommentMetadata & { channel_id: string | null };
+
+const handleChangeStateSubmit = async (payload: SlackViewSubmission): Promise<ViewSubmitResponse> => {
+  const teamId = payload.team.id;
+  const slackUserId = payload.user.id;
+
+  let metadata: ChangeStateMetadata;
+  try {
+    metadata = JSON.parse(payload.view.private_metadata) as ChangeStateMetadata;
+  } catch {
+    return errorResponse({ state: "Modal metadata corrupt — try again" });
+  }
+
+  const stateId = payload.view.state.values.state?.state_id?.selected_option?.value;
+  if (!stateId) {
+    return errorResponse({ state: "Pick a state" });
+  }
+
+  let r;
+  try {
+    r = await callDjango<{
+      id: string;
+      state_id?: string;
+      state_name?: string;
+      state_group?: string;
+      unchanged?: boolean;
+    }>("POST", "/api/v1/silo/work-items/state/", {
+      workspace_slug: metadata.workspace_slug,
+      project_id: metadata.project_id,
+      issue_id: metadata.issue_id,
+      state_id: stateId,
+      slack_user_id: slackUserId,
+      slack_team_id: teamId,
+    });
+  } catch (err) {
+    console.error("[silo] change-state network error:", err);
+    return errorResponse({ state: "Could not reach Plane — try again" });
+  }
+
+  if (r.status >= 300) {
+    console.error(`[silo] change-state failed: ${r.status} ${JSON.stringify(r.data)}`);
+    return errorResponse({ state: `Plane rejected the request (${r.status})` });
+  }
+
+  if (metadata.channel_id) {
+    const ref = `${metadata.project_identifier}-${metadata.sequence_id}`;
+    const text = r.data.unchanged
+      ? `*${ref}* was already in *${r.data.state_name ?? "that state"}*.`
+      : `Moved *${ref}* → *${r.data.state_name ?? "updated"}*.`;
+    void callSlackApiForTeam("chat.postEphemeral", teamId, {
+      channel: metadata.channel_id,
+      user: slackUserId,
+      text,
+    }).catch((err) => {
+      console.error("[silo] change-state postEphemeral failed:", err);
+    });
+  }
+
+  return {};
 };
 
 const handleReplyCommentSubmit = async (payload: SlackViewSubmission): Promise<ViewSubmitResponse> => {
@@ -665,6 +867,11 @@ export const slackInteractionsRouter = (): Router => {
             res.status(200).json(out);
             return;
           }
+          if (view?.callback_id === CHANGE_STATE_CALLBACK) {
+            const out = await handleChangeStateSubmit(payload as SlackViewSubmission);
+            res.status(200).json(out);
+            return;
+          }
           if (view?.callback_id === LINK_TO_MESSAGE_VIEW_CALLBACK) {
             const out = await handleLinkToMessageSubmit(payload as SlackViewSubmission);
             res.status(200).json(out);
@@ -704,6 +911,20 @@ export const slackInteractionsRouter = (): Router => {
             res.status(200).end();
             handleReplyButton(ba).catch((err) => {
               console.error("[silo] reply button handler crashed:", err);
+            });
+            return;
+          }
+          if (action?.action_id === "plane_assign_me") {
+            res.status(200).end();
+            handleAssignMe(ba).catch((err) => {
+              console.error("[silo] assign-me handler crashed:", err);
+            });
+            return;
+          }
+          if (action?.action_id === "plane_change_state") {
+            res.status(200).end();
+            handleChangeStateButton(ba).catch((err) => {
+              console.error("[silo] change-state button handler crashed:", err);
             });
             return;
           }

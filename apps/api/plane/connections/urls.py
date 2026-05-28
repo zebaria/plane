@@ -5,6 +5,8 @@
 from django.urls import path
 
 from .views import (
+    SiloAddAssigneeEndpoint,
+    SiloChangeStateEndpoint,
     SiloPingEndpoint,
     SiloCreateCommentEndpoint,
     SiloCreateWorkItemEndpoint,
@@ -78,6 +80,16 @@ urlpatterns = [
         "silo/work-items/",
         SiloCreateWorkItemEndpoint.as_view(http_method_names=["post"]),
         name="silo-create-work-item",
+    ),
+    path(
+        "silo/work-items/assignees/",
+        SiloAddAssigneeEndpoint.as_view(http_method_names=["post"]),
+        name="silo-work-item-add-assignee",
+    ),
+    path(
+        "silo/work-items/state/",
+        SiloChangeStateEndpoint.as_view(http_method_names=["post"]),
+        name="silo-work-item-change-state",
     ),
     # workspace credentials
     path(
