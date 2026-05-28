@@ -42,7 +42,10 @@ export function createApp(): Express {
   ]);
   const jsonParser = express.json({ limit: "5mb" });
   app.use((req, res, next) => {
-    if (SLACK_RAW_PATHS.has(req.path)) return next();
+    // Normalize trailing slash — a webhook hit with `/api/slack/commands/`
+    // would otherwise miss the set, get JSON-parsed, and fail HMAC verify.
+    const cleanPath = req.path.length > 1 ? req.path.replace(/\/+$/, "") : req.path;
+    if (SLACK_RAW_PATHS.has(cleanPath)) return next();
     return jsonParser(req, res, next);
   });
 

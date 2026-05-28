@@ -139,53 +139,65 @@ class SiloSlackInstallEndpoint(BaseAPIView):
             "is_active": True,
             "deleted_at": None,
         }
-        cred = WorkspaceCredential.objects.filter(
-            workspace=ws, source="slack", source_identifier=team_id
-        ).first()
-        if not cred:
-            cred = (
-                WorkspaceCredential.all_objects.filter(
-                    workspace=ws, source="slack", source_identifier=team_id
+        # Set crum + request.user to `installer` so BaseModel.save and any
+        # save signals see the resolved actor instead of the anonymous silo
+        # principal — otherwise created_by/updated_by audit columns land None.
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        prev_request_user = request.user
+        set_current_user(installer)
+        request.user = installer
+        try:
+            cred = WorkspaceCredential.objects.filter(
+                workspace=ws, source="slack", source_identifier=team_id
+            ).first()
+            if not cred:
+                cred = (
+                    WorkspaceCredential.all_objects.filter(
+                        workspace=ws, source="slack", source_identifier=team_id
+                    )
+                    .order_by("-deleted_at")
+                    .first()
                 )
-                .order_by("-deleted_at")
-                .first()
-            )
-        if cred:
-            for k, v in cred_defaults.items():
-                setattr(cred, k, v)
-            cred.save()
-        else:
-            cred = WorkspaceCredential.objects.create(
-                workspace=ws, source="slack", source_identifier=team_id, **cred_defaults
-            )
+            if cred:
+                for k, v in cred_defaults.items():
+                    setattr(cred, k, v)
+                cred.save()
+            else:
+                cred = WorkspaceCredential.objects.create(
+                    workspace=ws, source="slack", source_identifier=team_id, **cred_defaults
+                )
 
-        conn_defaults = {
-            "credential": cred,
-            "connection_slug": team_name,
-            "connection_data": {"bot_user_id": bot_user_id, "team_name": team_name},
-            "scopes": [s for s in scope.split(",") if s],
-            "config": {},
-            "deleted_at": None,
-        }
-        conn = WorkspaceConnection.objects.filter(
-            workspace=ws, connection_type="slack", connection_id=team_id
-        ).first()
-        if not conn:
-            conn = (
-                WorkspaceConnection.all_objects.filter(
-                    workspace=ws, connection_type="slack", connection_id=team_id
+            conn_defaults = {
+                "credential": cred,
+                "connection_slug": team_name,
+                "connection_data": {"bot_user_id": bot_user_id, "team_name": team_name},
+                "scopes": [s for s in scope.split(",") if s],
+                "config": {},
+                "deleted_at": None,
+            }
+            conn = WorkspaceConnection.objects.filter(
+                workspace=ws, connection_type="slack", connection_id=team_id
+            ).first()
+            if not conn:
+                conn = (
+                    WorkspaceConnection.all_objects.filter(
+                        workspace=ws, connection_type="slack", connection_id=team_id
+                    )
+                    .order_by("-deleted_at")
+                    .first()
                 )
-                .order_by("-deleted_at")
-                .first()
-            )
-        if conn:
-            for k, v in conn_defaults.items():
-                setattr(conn, k, v)
-            conn.save()
-        else:
-            conn = WorkspaceConnection.objects.create(
-                workspace=ws, connection_type="slack", connection_id=team_id, **conn_defaults
-            )
+            if conn:
+                for k, v in conn_defaults.items():
+                    setattr(conn, k, v)
+                conn.save()
+            else:
+                conn = WorkspaceConnection.objects.create(
+                    workspace=ws, connection_type="slack", connection_id=team_id, **conn_defaults
+                )
+        finally:
+            set_current_user(prev_user)
+            request.user = prev_request_user
         return Response(
             {
                 "credential_id": str(cred.id),
@@ -386,27 +398,38 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
             "config": {},
             "deleted_at": None,
         }
-        conn = WorkspaceUserConnection.objects.filter(
-            workspace=ws, user=user, connection_type="slack"
-        ).first()
-        if not conn:
-            conn = (
-                WorkspaceUserConnection.all_objects.filter(
-                    workspace=ws, user=user, connection_type="slack"
+        # Set crum + request.user to `user` so audit columns and signals
+        # see the actual Plane user instead of the anonymous silo principal.
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        prev_request_user = request.user
+        set_current_user(user)
+        request.user = user
+        try:
+            conn = WorkspaceUserConnection.objects.filter(
+                workspace=ws, user=user, connection_type="slack"
+            ).first()
+            if not conn:
+                conn = (
+                    WorkspaceUserConnection.all_objects.filter(
+                        workspace=ws, user=user, connection_type="slack"
+                    )
+                    .order_by("-deleted_at")
+                    .first()
                 )
-                .order_by("-deleted_at")
-                .first()
-            )
-        if conn:
-            created = False
-            for k, v in user_conn_defaults.items():
-                setattr(conn, k, v)
-            conn.save()
-        else:
-            created = True
-            conn = WorkspaceUserConnection.objects.create(
-                workspace=ws, user=user, connection_type="slack", **user_conn_defaults
-            )
+            if conn:
+                created = False
+                for k, v in user_conn_defaults.items():
+                    setattr(conn, k, v)
+                conn.save()
+            else:
+                created = True
+                conn = WorkspaceUserConnection.objects.create(
+                    workspace=ws, user=user, connection_type="slack", **user_conn_defaults
+                )
+        finally:
+            set_current_user(prev_user)
+            request.user = prev_request_user
         return Response(
             {"id": str(conn.id), "created": created},
             status=status.HTTP_200_OK,
@@ -489,7 +512,9 @@ class SiloCreateCommentEndpoint(BaseAPIView):
         # we never leak crum state into another request on the same worker.
         from crum import set_current_user, get_current_user
         prev_user = get_current_user()
+        prev_request_user = request.user
         set_current_user(actor)
+        request.user = actor
         try:
             comment = serializer.save(
                 project_id=project.id,
@@ -499,6 +524,7 @@ class SiloCreateCommentEndpoint(BaseAPIView):
             )
         finally:
             set_current_user(prev_user)
+            request.user = prev_request_user
 
         # Fire activity so silo notification fan-out runs.
         from plane.bgtasks.issue_activities_task import issue_activity
@@ -732,11 +758,14 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         # don't leak crum state into another request on the same worker.
         from crum import set_current_user, get_current_user
         prev_user = get_current_user()
+        prev_request_user = request.user
         set_current_user(actor)
+        request.user = actor
         try:
             serializer.save()
         finally:
             set_current_user(prev_user)
+            request.user = prev_request_user
         issue = serializer.instance
 
         # Fire the same activity hook as the public IssueListCreate

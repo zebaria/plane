@@ -65,7 +65,7 @@ def _silo_url(path: str) -> str:
         or os.environ.get("SILO_PUBLIC_BASE_URL")
         or "http://silo:3005"
     )
-    base_path = os.environ.get("SILO_BASE_PATH", "/silo")
+    base_path = os.environ.get("SILO_BASE_PATH", "/silo").rstrip("/")
     return f"{base.rstrip('/')}{base_path}{path}"
 
 
@@ -441,7 +441,7 @@ def dispatch_silo_work_item_event(
 
         body = json.dumps(payload)
         path = "/api/notifications/work-item-event"
-        full_silo_path = (os.environ.get("SILO_BASE_PATH", "/silo")) + path
+        full_silo_path = os.environ.get("SILO_BASE_PATH", "/silo").rstrip("/") + path
         ts, sig = _sign("POST", full_silo_path, body)
 
         url = _silo_url(path)

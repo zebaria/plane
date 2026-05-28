@@ -150,14 +150,20 @@ const handleLinkShared = async (payload: SlackEventCallback, webBaseUrl: string)
     return;
   }
 
-  // Look up every Plane URL in parallel — they're independent.
+  // Look up every Plane URL in parallel — they're independent. Wrap each
+  // in try/catch so one failed lookup doesn't drop unfurls for the others.
   const lookups = await Promise.all(
     links.map(async (link) => {
-      const parsed = parseWorkItemUrl(link.url);
-      if (!parsed) return null;
-      const item = await lookupWorkItem(parsed);
-      if (!item) return null;
-      return { url: link.url, blocks: buildUnfurlBlocks(item, webBaseUrl) };
+      try {
+        const parsed = parseWorkItemUrl(link.url);
+        if (!parsed) return null;
+        const item = await lookupWorkItem(parsed);
+        if (!item) return null;
+        return { url: link.url, blocks: buildUnfurlBlocks(item, webBaseUrl) };
+      } catch (err) {
+        console.warn(`[silo] unfurl lookup failed for ${link.url}: ${(err as Error).message}`);
+        return null;
+      }
     })
   );
   const unfurls: Record<string, Record<string, unknown>> = {};
