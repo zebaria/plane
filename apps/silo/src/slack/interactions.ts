@@ -63,6 +63,7 @@ type SlackBlockActions = {
     hash?: string;
     callback_id: string;
     private_metadata: string;
+    state?: { values: Record<string, Record<string, SlackInputState>> };
   };
   actions: {
     action_id: string;
@@ -202,12 +203,20 @@ const handleProjectChange = async (payload: SlackBlockActions): Promise<void> =>
     console.warn("[silo] project-metadata fetch on change failed:", err);
   }
 
+  // Preserve whatever the user has already typed — Slack doesn't
+  // carry input values across views.update unless we re-render them
+  // back into initial_value.
+  const stateValues = view.state?.values;
+  const currentTitle = stateValues?.title?.title?.value ?? metadata.initialText ?? "";
+  const currentDescription = stateValues?.description?.description?.value ?? "";
+
   const updated = buildCreateWorkItemView(
     ctx.projects,
     metadata,
     newProjectId,
     projectMeta,
-    metadata.initialText ?? ""
+    currentTitle,
+    currentDescription
   );
 
   const result = await callSlackApiForTeam("views.update", teamId, {

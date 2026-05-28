@@ -138,7 +138,8 @@ export const buildCreateWorkItemView = (
   metadata: CreateWorkItemMetadata,
   selectedProjectId: string | null,
   projectMeta: ProjectMetadata | null,
-  initialText = ""
+  initialText = "",
+  initialDescription = ""
 ): Record<string, unknown> => {
   const projectOptions = projects.slice(0, 100).map((p) => ({
     text: { type: "plain_text", text: truncate(`${p.identifier} — ${p.name}`, 75) },
@@ -200,6 +201,7 @@ export const buildCreateWorkItemView = (
         type: "plain_text_input",
         action_id: "description",
         multiline: true,
+        initial_value: initialDescription || undefined,
       },
     },
   ];

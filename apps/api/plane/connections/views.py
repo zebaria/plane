@@ -873,9 +873,12 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Escape so user-typed `<`, `>`, `&` don't get stripped or
+        # mis-parsed by the editor's HTML sanitizer.
+        import html as _html
         payload = {
             "name": title[:255],
-            "description_html": f"<p>{description}</p>" if description else "<p></p>",
+            "description_html": f"<p>{_html.escape(description)}</p>" if description else "<p></p>",
         }
         if type_id:
             payload["type_id"] = type_id

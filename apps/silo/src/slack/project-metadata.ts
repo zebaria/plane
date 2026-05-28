@@ -30,6 +30,10 @@ export type ProjectMetadata = {
 };
 
 const CACHE_TTL_MS = 60_000;
+// Bounded FIFO. Map preserves insertion order, so deleting the first
+// key on overflow drops the oldest entry. invalidate is rarely called
+// in practice, so without this the cache would grow unbounded.
+const CACHE_MAX_ENTRIES = 1000;
 type CacheEntry = { value: ProjectMetadata; fetchedAt: number };
 const cache = new Map<string, CacheEntry>();
 
@@ -68,6 +72,10 @@ export const fetchProjectMetadata = async (workspaceSlug: string, projectId: str
     defaultTypeId: res.data.default_type_id ?? null,
     priorities: res.data.priorities ?? [],
   };
+  if (cache.size >= CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
   cache.set(key, { value, fetchedAt: Date.now() });
   return value;
 };
