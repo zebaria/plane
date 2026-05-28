@@ -219,8 +219,10 @@ export const slackEventsRouter = (): Router => {
       const ts = req.header("x-slack-request-timestamp") ?? undefined;
       const sig = req.header("x-slack-signature") ?? undefined;
 
+      console.log(`[silo] events hit: bodyLen=${rawBody.length} hasTs=${!!ts} hasSig=${!!sig}`);
       const verdict = verifySlackSignature(slack.signingSecret, rawBody, ts, sig);
       if (!verdict.ok) {
+        console.warn(`[silo] events sig fail: ${verdict.reason}`);
         res.status(verdict.status).type("text/plain").send(verdict.reason);
         return;
       }
@@ -233,6 +235,9 @@ export const slackEventsRouter = (): Router => {
         return;
       }
 
+      console.log(
+        `[silo] events payload type=${payload.type} eventType=${(payload as SlackEventCallback).event?.type ?? "n/a"}`
+      );
       if (payload.type === "url_verification") {
         res.status(200).json({ challenge: (payload as SlackUrlVerification).challenge });
         return;

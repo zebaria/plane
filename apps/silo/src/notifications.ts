@@ -321,10 +321,13 @@ export const notificationsRouter = (): Router => {
     const ts = req.header("x-silo-timestamp") ?? undefined;
     const sig = req.header("x-silo-signature") ?? undefined;
 
+    console.log(`[silo] notifications hit: bodyLen=${rawBody.length} hasTs=${!!ts} hasSig=${!!sig}`);
+
     // Django signs against the path it sees (full /silo/... path).
     const fullPath = `${config.basePath}${NOTIFICATION_PATH}`;
     const verdict = verifyDjangoHmac(rawBody, "POST", fullPath, ts, sig);
     if (!verdict.ok) {
+      console.warn(`[silo] notifications sig fail: ${verdict.reason}`);
       res.status(verdict.status).type("text/plain").send(verdict.reason);
       return;
     }
@@ -336,6 +339,10 @@ export const notificationsRouter = (): Router => {
       res.status(400).type("text/plain").send("invalid json");
       return;
     }
+
+    console.log(
+      `[silo] notifications event_type=${event.event_type ?? "?"} project=${event.project_id ?? "?"} issue=${event.issue_id ?? "?"}`
+    );
 
     // Ack immediately; do work async.
     res.status(200).end();

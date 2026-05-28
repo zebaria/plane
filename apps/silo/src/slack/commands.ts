@@ -101,13 +101,18 @@ export const slackCommandsRouter = (): Router => {
       const ts = req.header("x-slack-request-timestamp") ?? undefined;
       const sig = req.header("x-slack-signature") ?? undefined;
 
+      console.log(`[silo] commands hit: bodyLen=${rawBody.length} hasTs=${!!ts} hasSig=${!!sig}`);
       const verdict = verifySlackSignature(slack.signingSecret, rawBody, ts, sig);
       if (!verdict.ok) {
+        console.warn(`[silo] commands sig fail: ${verdict.reason}`);
         res.status(verdict.status).type("text/plain").send(verdict.reason);
         return;
       }
 
       const payload = parseForm(rawBody);
+      console.log(
+        `[silo] commands payload command=${payload.command ?? "?"} team=${payload.team_id ?? "?"} user=${payload.user_id ?? "?"}`
+      );
       // Ack immediately so Slack doesn't see us blow the 3s budget.
       res.status(200).end();
 
