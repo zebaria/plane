@@ -32,10 +32,10 @@ import type { Request, Response, Router } from "express";
 import express from "express";
 
 import { getSlackConfig } from "../config";
-import { callDjango } from "../django-client";
 import { callSlackApiForTeam } from "./api";
 import { verifySlackSignature } from "./signature";
 import { resolveTeamContext } from "./team-context";
+import { lookupWorkItem, parseWorkItemUrl, type WorkItemLookup } from "./work-items";
 
 type SlackUrlVerification = {
   type: "url_verification";
@@ -60,84 +60,6 @@ type SlackEventCallback = {
 };
 
 type SlackEvent = SlackUrlVerification | SlackEventCallback | { type: string };
-
-// Match Plane work-item URLs. Two forms:
-//   http(s)://<host>/<workspace-slug>/browse/<IDENT>-<SEQ>
-//   http(s)://<host>/<workspace-slug>/projects/<uuid>/issues/<uuid>
-// The /browse/ form is what the FE renders today; the /projects/ form
-// is the legacy redirect target (and also used by some integrations
-// that build links from raw IDs). Host is intentionally not pinned —
-// Slack already filters to the app domains we register in the Slack
-// app config, so anything that reaches us is by definition a Plane host.
-const BROWSE_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/browse\/([A-Za-z0-9_]+)-(\d+)/;
-const LEGACY_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/projects\/([0-9a-f-]{36})\/issues\/([0-9a-f-]{36})/i;
-
-type ParsedWorkItemUrl =
-  | {
-      kind: "browse";
-      workspaceSlug: string;
-      projectIdentifier: string;
-      sequenceId: number;
-    }
-  | {
-      kind: "legacy";
-      workspaceSlug: string;
-      projectId: string;
-      issueId: string;
-    };
-
-const parseWorkItemUrl = (url: string): ParsedWorkItemUrl | null => {
-  const b = BROWSE_URL_RE.exec(url);
-  if (b) {
-    const seq = Number.parseInt(b[3], 10);
-    if (!Number.isSafeInteger(seq)) return null;
-    return {
-      kind: "browse",
-      workspaceSlug: b[1],
-      projectIdentifier: b[2].toUpperCase(),
-      sequenceId: seq,
-    };
-  }
-  const l = LEGACY_URL_RE.exec(url);
-  if (l) {
-    return { kind: "legacy", workspaceSlug: l[1], projectId: l[2], issueId: l[3] };
-  }
-  return null;
-};
-
-type WorkItemLookup = {
-  id: string;
-  sequence_id: number;
-  name: string;
-  project_identifier: string;
-  state_name: string | null;
-  state_group: string | null;
-  priority: string | null;
-  workspace_slug: string;
-  project_id: string;
-};
-
-const lookupWorkItem = async (parsed: ParsedWorkItemUrl): Promise<WorkItemLookup | null> => {
-  const body: Record<string, unknown> =
-    parsed.kind === "browse"
-      ? {
-          workspace_slug: parsed.workspaceSlug,
-          project_identifier: parsed.projectIdentifier,
-          sequence_id: parsed.sequenceId,
-        }
-      : {
-          workspace_slug: parsed.workspaceSlug,
-          project_id: parsed.projectId,
-          issue_id: parsed.issueId,
-        };
-  const r = await callDjango<WorkItemLookup>("POST", "/api/v1/silo/work-items/lookup/", body);
-  if (r.status === 404) return null;
-  if (r.status >= 300) {
-    console.error(`[silo] work-item lookup failed: ${r.status} ${JSON.stringify(r.data)}`);
-    return null;
-  }
-  return r.data;
-};
 
 const buildUnfurlBlocks = (item: WorkItemLookup, webBaseUrl: string): Record<string, unknown> => {
   const ref = `${item.project_identifier}-${item.sequence_id}`;
