@@ -186,9 +186,11 @@ def dispatch_silo_work_item_event(
     try:
         # Fail fast on malformed UUIDs — querying with a bad string raises
         # ValidationError deep in the ORM and dirties the logs.
+        # project_id is required — without it we can't look up mappings.
+        if not project_id:
+            return
         try:
-            if project_id:
-                uuid.UUID(str(project_id))
+            uuid.UUID(str(project_id))
             if issue_id:
                 uuid.UUID(str(issue_id))
             if actor_id:

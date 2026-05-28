@@ -398,6 +398,25 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
             "config": {},
             "deleted_at": None,
         }
+        # Reject if this slack_user_id is already mapped to a different
+        # Plane user in this workspace — actor attribution downstream
+        # (SiloCreate{Comment,WorkItem}Endpoint) keys off slack_user_id,
+        # so duplicate mappings would silently misattribute.
+        clash = (
+            WorkspaceUserConnection.objects.filter(
+                workspace=ws,
+                connection_type="slack",
+                connection_id=slack_user_id,
+            )
+            .exclude(user=user)
+            .first()
+        )
+        if clash:
+            return Response(
+                {"detail": "slack_user_id already linked to another Plane user in this workspace"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         # Set crum + request.user to `user` so audit columns and signals
         # see the actual Plane user instead of the anonymous silo principal.
         from crum import set_current_user, get_current_user
