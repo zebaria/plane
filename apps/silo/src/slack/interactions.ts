@@ -18,6 +18,7 @@
  * `response_action: "clear"` ack + async post via chat.postMessage.
  */
 
+import axios from "axios";
 import type { Request, Response, Router } from "express";
 import express from "express";
 
@@ -362,16 +363,28 @@ type LinkToMessageMetadata = {
 };
 
 const fetchPermalink = async (teamId: string, channelId: string, messageTs: string): Promise<string | null> => {
-  const result = await callSlackApiForTeam<{ ok: boolean; permalink?: string; error?: string }>(
-    "chat.getPermalink",
-    teamId,
-    { channel: channelId, message_ts: messageTs }
-  );
-  if (!result || !result.ok || !result.permalink) {
-    console.warn(`[silo] chat.getPermalink failed: ${result?.error ?? "no-team-context"}`);
+  // chat.getPermalink is one of Slack's GET-style methods — it
+  // doesn't accept application/json bodies and rejects them with
+  // `invalid_arguments`. Use GET with query params instead, signed
+  // with the team's bot token.
+  try {
+    const ctx = await resolveTeamContext(teamId);
+    if (!ctx) return null;
+    const url = `https://slack.com/api/chat.getPermalink?channel=${encodeURIComponent(channelId)}&message_ts=${encodeURIComponent(messageTs)}`;
+    const res = await axios.get<{ ok: boolean; permalink?: string; error?: string }>(url, {
+      headers: { Authorization: `Bearer ${ctx.botToken}` },
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+    if (!res.data?.ok || !res.data.permalink) {
+      console.warn(`[silo] chat.getPermalink failed: ${res.data?.error ?? "unknown"}`);
+      return null;
+    }
+    return res.data.permalink;
+  } catch (err) {
+    console.warn("[silo] chat.getPermalink network error:", (err as Error).message);
     return null;
   }
-  return result.permalink;
 };
 
 const handleCreateFromMessage = async (payload: SlackMessageShortcut): Promise<void> => {
@@ -535,7 +548,13 @@ const handleLinkToMessageSubmit = async (payload: SlackViewSubmission): Promise<
     return errorResponse({ ref: "Use IDENT-NUMBER (e.g. WZ-1234)" });
   }
 
-  const item = await lookupWorkItem(parsed);
+  let item;
+  try {
+    item = await lookupWorkItem(parsed);
+  } catch (err) {
+    console.error("[silo] link-to-message work-item lookup network error:", err);
+    return errorResponse({ ref: "Could not reach Plane — try again" });
+  }
   if (!item) {
     return errorResponse({ ref: `No work item found matching ${ref}` });
   }
