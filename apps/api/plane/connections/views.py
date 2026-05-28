@@ -654,23 +654,49 @@ class SiloWorkItemLookupEndpoint(BaseAPIView):
         data = request.data or {}
         slug = data.get("workspace_slug")
         project_id = data.get("project_id")
+        project_identifier = data.get("project_identifier")
         sequence_id = data.get("sequence_id")
         issue_id = data.get("issue_id")
 
-        if not slug or not project_id or (not sequence_id and not issue_id):
+        if not slug or (not project_id and not project_identifier) or (not sequence_id and not issue_id):
             return Response(
-                {"detail": "workspace_slug, project_id, and one of sequence_id/issue_id required"},
+                {
+                    "detail": (
+                        "workspace_slug, one of project_id/project_identifier, "
+                        "and one of sequence_id/issue_id required"
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if project_identifier is not None and not isinstance(project_identifier, str):
+            return Response(
+                {"detail": "project_identifier must be a string"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if sequence_id and not issue_id:
+            try:
+                sequence_id = int(sequence_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {"detail": "sequence_id must be a valid integer"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         ws = get_object_or_404(Workspace, slug=slug)
-        project = get_object_or_404(Project, pk=project_id, workspace=ws)
+        if project_id:
+            project = get_object_or_404(Project, pk=project_id, workspace=ws)
+        else:
+            project = get_object_or_404(
+                Project, identifier__iexact=project_identifier.strip(), workspace=ws
+            )
 
         qs = Issue.objects.filter(workspace=ws, project=project)
         if issue_id:
             qs = qs.filter(pk=issue_id)
         else:
-            qs = qs.filter(sequence_id=int(sequence_id))
+            qs = qs.filter(sequence_id=sequence_id)
         issue = qs.select_related("state").first()
         if not issue:
             return Response({"detail": "not found"}, status=status.HTTP_404_NOT_FOUND)

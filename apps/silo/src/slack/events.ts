@@ -61,24 +61,48 @@ type SlackEventCallback = {
 
 type SlackEvent = SlackUrlVerification | SlackEventCallback | { type: string };
 
-// Match Plane work-item URLs:
+// Match Plane work-item URLs. Two forms:
+//   http(s)://<host>/<workspace-slug>/browse/<IDENT>-<SEQ>
 //   http(s)://<host>/<workspace-slug>/projects/<uuid>/issues/<uuid>
-// Host is intentionally not pinned — Slack already filters to the
-// app domains we register in the Slack app config (`link_shared`
-// only fires on subscribed domains), so anything that reaches us
-// is by definition a Plane host.
-const WORK_ITEM_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/projects\/([0-9a-f-]{36})\/issues\/([0-9a-f-]{36})/i;
+// The /browse/ form is what the FE renders today; the /projects/ form
+// is the legacy redirect target (and also used by some integrations
+// that build links from raw IDs). Host is intentionally not pinned —
+// Slack already filters to the app domains we register in the Slack
+// app config, so anything that reaches us is by definition a Plane host.
+const BROWSE_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/browse\/([A-Za-z0-9_]+)-(\d+)/;
+const LEGACY_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/projects\/([0-9a-f-]{36})\/issues\/([0-9a-f-]{36})/i;
 
-type ParsedWorkItemUrl = {
-  workspaceSlug: string;
-  projectId: string;
-  issueId: string;
-};
+type ParsedWorkItemUrl =
+  | {
+      kind: "browse";
+      workspaceSlug: string;
+      projectIdentifier: string;
+      sequenceId: number;
+    }
+  | {
+      kind: "legacy";
+      workspaceSlug: string;
+      projectId: string;
+      issueId: string;
+    };
 
 const parseWorkItemUrl = (url: string): ParsedWorkItemUrl | null => {
-  const m = WORK_ITEM_URL_RE.exec(url);
-  if (!m) return null;
-  return { workspaceSlug: m[1], projectId: m[2], issueId: m[3] };
+  const b = BROWSE_URL_RE.exec(url);
+  if (b) {
+    const seq = Number.parseInt(b[3], 10);
+    if (!Number.isSafeInteger(seq)) return null;
+    return {
+      kind: "browse",
+      workspaceSlug: b[1],
+      projectIdentifier: b[2].toUpperCase(),
+      sequenceId: seq,
+    };
+  }
+  const l = LEGACY_URL_RE.exec(url);
+  if (l) {
+    return { kind: "legacy", workspaceSlug: l[1], projectId: l[2], issueId: l[3] };
+  }
+  return null;
 };
 
 type WorkItemLookup = {
@@ -94,11 +118,19 @@ type WorkItemLookup = {
 };
 
 const lookupWorkItem = async (parsed: ParsedWorkItemUrl): Promise<WorkItemLookup | null> => {
-  const r = await callDjango<WorkItemLookup>("POST", "/api/v1/silo/work-items/lookup/", {
-    workspace_slug: parsed.workspaceSlug,
-    project_id: parsed.projectId,
-    issue_id: parsed.issueId,
-  });
+  const body: Record<string, unknown> =
+    parsed.kind === "browse"
+      ? {
+          workspace_slug: parsed.workspaceSlug,
+          project_identifier: parsed.projectIdentifier,
+          sequence_id: parsed.sequenceId,
+        }
+      : {
+          workspace_slug: parsed.workspaceSlug,
+          project_id: parsed.projectId,
+          issue_id: parsed.issueId,
+        };
+  const r = await callDjango<WorkItemLookup>("POST", "/api/v1/silo/work-items/lookup/", body);
   if (r.status === 404) return null;
   if (r.status >= 300) {
     console.error(`[silo] work-item lookup failed: ${r.status} ${JSON.stringify(r.data)}`);
