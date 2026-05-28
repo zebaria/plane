@@ -41,6 +41,11 @@ ENV TURBO_TELEMETRY_DISABLED=1
 
 RUN pnpm turbo run build --filter=silo
 
+# Flatten silo's hoisted/symlinked node_modules into a self-contained
+# directory the runtime stage can use without the rest of the monorepo.
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+  pnpm --filter silo --prod --legacy deploy --no-optional /deploy
+
 # *****************************************************************************
 # STAGE 3: Runtime
 # *****************************************************************************
@@ -49,12 +54,9 @@ WORKDIR /app
 
 RUN apk add --no-cache curl
 
-# Copy built artifact + a minimal node_modules. tsdown bundles deps into
-# dist/start.mjs; we still ship node_modules in case any dep is left
-# external (sharp-style native bindings).
+COPY --from=installer /deploy/package.json ./package.json
+COPY --from=installer /deploy/node_modules ./node_modules
 COPY --from=installer /app/apps/silo/dist ./dist
-COPY --from=installer /app/apps/silo/package.json ./package.json
-COPY --from=installer /app/apps/silo/node_modules ./node_modules
 
 ENV NODE_ENV=production
 EXPOSE 3005
