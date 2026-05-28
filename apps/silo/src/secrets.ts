@@ -36,6 +36,19 @@ const required = <K extends string>(obj: Record<string, unknown>, keys: K[], nam
 };
 
 export const loadSlackSecrets = async (env: string): Promise<SlackSecrets> => {
+  // Local-dev fallback: if all three Slack env vars are present, skip
+  // Secrets Manager entirely. Avoids the dev-loop crashing when the
+  // workstation has no AWS creds for the silo IAM role's namespace.
+  const envClientId = process.env.SLACK_CLIENT_ID;
+  const envClientSecret = process.env.SLACK_CLIENT_SECRET;
+  const envSigningSecret = process.env.SLACK_SIGNING_SECRET;
+  if (envClientId && envClientSecret && envSigningSecret) {
+    return {
+      client_id: envClientId,
+      client_secret: envClientSecret,
+      signing_secret: envSigningSecret,
+    };
+  }
   const v = await fetchJson<SlackSecrets>("plane-slack", env);
   required(v as unknown as Record<string, unknown>, ["client_id", "client_secret", "signing_secret"], "plane-slack");
   return v;

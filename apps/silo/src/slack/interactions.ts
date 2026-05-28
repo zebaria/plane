@@ -52,6 +52,10 @@ type ViewSubmitResponse = Record<string, unknown>;
 
 const REPLY_COMMENT_CALLBACK = "plane_reply_comment_modal";
 
+// HTML-entity-style escape; same form Slack mrkdwn expects for `<`, `>`, `&`
+// and what HTML requires for embedded text in `<p>...</p>`.
+const slackEscape = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
 type ReplyCommentMetadata = {
   workspace_slug: string;
   project_id: string;
@@ -166,7 +170,7 @@ const handleReplyButton = async (payload: SlackBlockActions): Promise<void> => {
         elements: [
           {
             type: "mrkdwn",
-            text: `Reply to *${metadata.project_identifier}-${metadata.sequence_id}: ${metadata.issue_name}*`,
+            text: `Reply to *${slackEscape(metadata.project_identifier)}-${metadata.sequence_id}: ${slackEscape(metadata.issue_name)}*`,
           },
         ],
       },
@@ -212,10 +216,7 @@ const handleReplyCommentSubmit = async (payload: SlackViewSubmission): Promise<V
   // editor can round-trip. Slack's plain_text_input doesn't preserve
   // formatting; if we add a richer composer later, swap to
   // rich_text_input + a Slack-mrkdwn → HTML converter.
-  const commentHtml = `<p>${text
-    .split("\n")
-    .map((line) => line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"))
-    .join("</p><p>")}</p>`;
+  const commentHtml = `<p>${text.split("\n").map(slackEscape).join("</p><p>")}</p>`;
 
   let r;
   try {

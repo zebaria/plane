@@ -334,6 +334,10 @@ def dispatch_silo_work_item_event(
                 # A bare string would iterate character-by-character below.
                 if isinstance(vals, str):
                     vals = [vals]
+                # A single dict (one assignee) would otherwise iterate its
+                # keys ("id", "email") and the actual UUID would be missed.
+                if isinstance(vals, dict):
+                    vals = [vals]
                 out: set[str] = set()
                 for v in vals:
                     if isinstance(v, dict):

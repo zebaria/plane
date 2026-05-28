@@ -501,7 +501,10 @@ class SiloCreateCommentEndpoint(BaseAPIView):
         # and comment_json (Lexical editor format) is populated — the FE
         # comment renderer reads comment_json, so a direct ORM create
         # would render as an empty bubble.
-        serializer = IssueCommentSerializer(data={"comment_html": comment_html})
+        serializer = IssueCommentSerializer(
+            data={"comment_html": comment_html},
+            context={"request": request},
+        )
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
