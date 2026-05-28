@@ -69,7 +69,7 @@ type SlackEvent = SlackUrlVerification | SlackEventCallback | { type: string };
 // that build links from raw IDs). Host is intentionally not pinned —
 // Slack already filters to the app domains we register in the Slack
 // app config, so anything that reaches us is by definition a Plane host.
-const BROWSE_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/browse\/([A-Za-z0-9]+)-(\d+)/;
+const BROWSE_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/browse\/([A-Za-z0-9_]+)-(\d+)/;
 const LEGACY_URL_RE = /^https?:\/\/[^/]+\/([^/]+)\/projects\/([0-9a-f-]{36})\/issues\/([0-9a-f-]{36})/i;
 
 type ParsedWorkItemUrl =
@@ -90,7 +90,7 @@ const parseWorkItemUrl = (url: string): ParsedWorkItemUrl | null => {
   const b = BROWSE_URL_RE.exec(url);
   if (b) {
     const seq = Number.parseInt(b[3], 10);
-    if (!Number.isFinite(seq)) return null;
+    if (!Number.isSafeInteger(seq)) return null;
     return {
       kind: "browse",
       workspaceSlug: b[1],
