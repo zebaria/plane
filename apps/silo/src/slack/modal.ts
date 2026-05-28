@@ -222,7 +222,7 @@ export const buildCreateWorkItemView = (
     // Caller-supplied state is ignored server-side for intake items.
     // Only render if the project has Intake enabled; otherwise the
     // toggle would create a stray Intake the user never opted into.
-    if (projectMeta.intakeEnabled)
+    if (projectMeta.intakeEnabled) {
       blocks.push({
         type: "input",
         block_id: "as_intake",
@@ -243,6 +243,7 @@ export const buildCreateWorkItemView = (
           ],
         },
       });
+    }
   }
 
   return {
