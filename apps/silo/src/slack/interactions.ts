@@ -266,7 +266,12 @@ export const slackInteractionsRouter = (): Router => {
       const payloadJson = params.get("payload") ?? "";
       let payload: { type: string; [k: string]: unknown };
       try {
-        payload = JSON.parse(payloadJson);
+        const parsed = JSON.parse(payloadJson);
+        if (!parsed || typeof parsed !== "object") {
+          res.status(400).type("text/plain").send("invalid payload JSON");
+          return;
+        }
+        payload = parsed;
         console.log(
           `[silo] interactions payload type=${payload.type} action_id=${(payload as unknown as SlackBlockActions).actions?.[0]?.action_id ?? "n/a"}`
         );

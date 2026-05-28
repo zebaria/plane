@@ -57,20 +57,26 @@ export const resolveTeamContext = async (teamId: string): Promise<SlackTeamConte
   if (res.status >= 300) {
     throw new Error(`team-context lookup failed: ${res.status} ${JSON.stringify(res.data)}`);
   }
-  if (!res.data.bot_token) {
+  // Guard against a 200 with empty/null body (e.g. proxy munged the
+  // response) — accessing fields on null below would throw a TypeError.
+  const data = res.data;
+  if (!data || typeof data !== "object") {
+    throw new Error(`team-context returned non-object body for team_id=${teamId}`);
+  }
+  if (!data.bot_token) {
     throw new Error(`team-context returned no bot_token for team_id=${teamId}`);
   }
 
   const value: SlackTeamContext = {
-    workspaceId: res.data.workspace_id,
-    workspaceSlug: res.data.workspace_slug,
-    workspaceName: res.data.workspace_name,
-    botToken: res.data.bot_token,
-    refreshToken: res.data.refresh_token,
-    tokenExpiresAt: res.data.token_expires_at ? new Date(res.data.token_expires_at).getTime() : null,
-    botUserId: res.data.bot_user_id,
-    installerUserId: res.data.installer_user_id,
-    projects: res.data.projects ?? [],
+    workspaceId: data.workspace_id,
+    workspaceSlug: data.workspace_slug,
+    workspaceName: data.workspace_name,
+    botToken: data.bot_token,
+    refreshToken: data.refresh_token,
+    tokenExpiresAt: data.token_expires_at ? new Date(data.token_expires_at).getTime() : null,
+    botUserId: data.bot_user_id,
+    installerUserId: data.installer_user_id,
+    projects: data.projects ?? [],
   };
   cache.set(teamId, { value, fetchedAt: Date.now() });
   return value;

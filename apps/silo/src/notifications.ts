@@ -109,34 +109,43 @@ const verifyDjangoHmac = (
   return { ok: true };
 };
 
+// Slack mrkdwn treats `<`, `>`, `&` as control characters; raw user input
+// (issue names, display names, state names) inside link tags would break
+// rendering. Escape with HTML-entity-style replacements per Slack docs.
+const slackEscape = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
 const buildBlocks = (event: WorkItemEvent, webBaseUrl: string): Record<string, unknown>[] => {
   const issue = event.issue;
   if (!issue)
     return [{ type: "section", text: { type: "mrkdwn", text: `_(no issue payload for ${event.event_type})_` } }];
 
-  const ref = `${event.project_identifier}-${issue.sequence_id}`;
+  const ref = slackEscape(`${event.project_identifier}-${issue.sequence_id}`);
   const url = `${webBaseUrl}/${event.workspace_slug}/projects/${event.project_id}/issues/${issue.id}`;
-  const actorName = event.actor?.display_name ?? event.actor?.email ?? "someone";
+  const actorName = slackEscape(event.actor?.display_name ?? event.actor?.email ?? "someone");
+  const issueName = slackEscape(issue.name);
 
   const sc = event.state_change;
-  const stateTransition = sc && sc.from_name && sc.to_name ? `${sc.from_name} → *${sc.to_name}*` : null;
+  const fromName = sc?.from_name ? slackEscape(sc.from_name) : null;
+  const toName = sc?.to_name ? slackEscape(sc.to_name) : null;
+  const stateTransition = fromName && toName ? `${fromName} → *${toName}*` : null;
 
   let leadText = "";
   switch (event.event_type) {
     case "work_item.created":
-      leadText = `*${actorName}* created *<${url}|${ref}: ${issue.name}>*`;
+      leadText = `*${actorName}* created *<${url}|${ref}: ${issueName}>*`;
       break;
     case "work_item.state_changed":
       leadText = stateTransition
-        ? `*${actorName}* moved *<${url}|${ref}: ${issue.name}>* — ${stateTransition}`
-        : `*${actorName}* updated *<${url}|${ref}: ${issue.name}>*`;
+        ? `*${actorName}* moved *<${url}|${ref}: ${issueName}>* — ${stateTransition}`
+        : `*${actorName}* updated *<${url}|${ref}: ${issueName}>*`;
       break;
     case "work_item.commented":
-      leadText = `*${actorName}* commented on *<${url}|${ref}: ${issue.name}>*`;
+      leadText = `*${actorName}* commented on *<${url}|${ref}: ${issueName}>*`;
       break;
     case "work_item.completed": {
       const verb = sc?.to_group === "cancelled" ? "cancelled" : "completed";
-      leadText = `*${actorName}* ${verb} *<${url}|${ref}: ${issue.name}>* — ${sc?.to_name ?? issue.state_name ?? ""}`;
+      const tail = toName ?? slackEscape(issue.state_name ?? "");
+      leadText = `*${actorName}* ${verb} *<${url}|${ref}: ${issueName}>* — ${tail}`;
       break;
     }
   }
