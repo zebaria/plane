@@ -1226,11 +1226,23 @@ class SiloChangeStateEndpoint(BaseAPIView):
         if prev_state_id == new_state.id:
             return Response({"id": str(issue.id), "unchanged": True}, status=status.HTTP_200_OK)
 
-        # .update() rather than .save() so BaseModel.save's crum-based
-        # actor lookup doesn't clobber updated_by with the silo
-        # anonymous principal. Activity log carries the explicit actor
-        # below.
-        Issue.objects.filter(pk=issue.pk).update(state_id=new_state.id, updated_by_id=actor.id)
+        # Going through issue.save() (not .update()) so the model's
+        # _sync_completed_at hook fires when transitioning to/from
+        # completed states. Override the crum thread-local user for
+        # the save so updated_by gets the resolved actor instead of
+        # silo's anonymous HMAC principal; restore in finally so we
+        # never leak crum state across requests on the same worker.
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        prev_request_user = request.user
+        set_current_user(actor)
+        request.user = actor
+        try:
+            issue.state = new_state
+            issue.save()
+        finally:
+            set_current_user(prev_user)
+            request.user = prev_request_user
 
         from plane.bgtasks.issue_activities_task import issue_activity
         import json as _json
