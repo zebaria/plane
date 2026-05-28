@@ -30,10 +30,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # New branch: scan commits not yet on any remote tracking branch.
         # Fall back to just the head commit on a fresh clone with no
         # remote-tracking refs (git log --not --remotes errors on no refs).
-        if git show-ref --remotes >/dev/null 2>&1; then
+        if [ -n "$(git for-each-ref --count=1 refs/remotes/ 2>/dev/null)" ]; then
             log_opts="$local_sha --not --remotes"
         else
-            log_opts="$local_sha"
+            # Fresh clone with no remote-tracking refs: scan only the head
+            # commit to avoid walking all of history.
+            log_opts="-1 $local_sha"
         fi
     else
         log_opts="$remote_sha..$local_sha"
