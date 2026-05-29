@@ -1,0 +1,28 @@
+{
+  "name": "Plane (dev)",
+  "url": "https://plane.dev.wildzebra.com",
+  "hook_attributes": {
+    "url": "https://plane.dev.wildzebra.com/silo/api/github-webhook",
+    "active": true
+  },
+  "redirect_url": "https://plane.dev.wildzebra.com/silo/api/github/manifest/callback",
+  "callback_urls": ["https://plane.dev.wildzebra.com/silo/api/github/team/auth/callback"],
+  "public": false,
+  "default_permissions": {
+    "issues": "write",
+    "pull_requests": "read",
+    "metadata": "read",
+    "members": "read",
+    "contents": "read"
+  },
+  "default_events": [
+    "installation",
+    "installation_repositories",
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "label",
+    "repository"
+  ]
+}
