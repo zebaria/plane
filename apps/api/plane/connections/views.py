@@ -207,6 +207,133 @@ class SiloSlackInstallEndpoint(BaseAPIView):
         )
 
 
+class SiloGithubInstallEndpoint(BaseAPIView):
+    """Persist a GitHub App installation completed by silo.
+
+    Silo handles the manifest + install dance and posts the resulting
+    installation_id here. We don't store the installation token —
+    GitHub mints fresh ones on demand and rotates them server-side, so
+    silo re-mints from the App private key whenever it needs one.
+    Idempotent on (workspace, source='github', source_identifier=
+    installation_id) for the credential and (workspace,
+    connection_type='github', connection_id=installation_id) for the
+    connection.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import User
+
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        installation_id = data.get("installation_id")
+        installer_user_id = data.get("installer_user_id")
+        account_login = data.get("account_login") or ""
+        account_id = data.get("account_id")
+        account_type = data.get("account_type") or ""
+        repository_selection = data.get("repository_selection") or "selected"
+        if not (slug and installation_id and installer_user_id):
+            return Response(
+                {
+                    "detail": "workspace_slug, installation_id, installer_user_id required"
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ws = get_object_or_404(Workspace, slug=slug)
+        installer = get_object_or_404(User, pk=installer_user_id)
+
+        cred_defaults = {
+            "user": installer,
+            # GitHub App installation tokens are 1h-lived and minted on
+            # demand from the App private key — we deliberately don't
+            # persist them. The non-empty source_authorization_type is
+            # the marker that this is a live install.
+            "source_access_token": "",
+            "source_refresh_token": "",
+            "source_token_expires_at": None,
+            "source_authorization_type": "GITHUB_APP_INSTALLATION",
+            "is_pat": False,
+            "is_active": True,
+            "deleted_at": None,
+        }
+
+        from crum import set_current_user, get_current_user
+        prev_user = get_current_user()
+        prev_request_user = request.user
+        set_current_user(installer)
+        request.user = installer
+        try:
+            cred = WorkspaceCredential.objects.filter(
+                workspace=ws, source="github", source_identifier=str(installation_id)
+            ).first()
+            if not cred:
+                cred = (
+                    WorkspaceCredential.all_objects.filter(
+                        workspace=ws, source="github", source_identifier=str(installation_id)
+                    )
+                    .order_by("-deleted_at")
+                    .first()
+                )
+            if cred:
+                for k, v in cred_defaults.items():
+                    setattr(cred, k, v)
+                cred.save()
+            else:
+                cred = WorkspaceCredential.objects.create(
+                    workspace=ws,
+                    source="github",
+                    source_identifier=str(installation_id),
+                    **cred_defaults,
+                )
+
+            conn_defaults = {
+                "credential": cred,
+                "connection_slug": account_login,
+                "connection_data": {
+                    "account_login": account_login,
+                    "account_id": account_id,
+                    "account_type": account_type,
+                    "repository_selection": repository_selection,
+                },
+                "scopes": [],
+                "config": {},
+                "deleted_at": None,
+            }
+            conn = WorkspaceConnection.objects.filter(
+                workspace=ws, connection_type="github", connection_id=str(installation_id)
+            ).first()
+            if not conn:
+                conn = (
+                    WorkspaceConnection.all_objects.filter(
+                        workspace=ws, connection_type="github", connection_id=str(installation_id)
+                    )
+                    .order_by("-deleted_at")
+                    .first()
+                )
+            if conn:
+                for k, v in conn_defaults.items():
+                    setattr(conn, k, v)
+                conn.save()
+            else:
+                conn = WorkspaceConnection.objects.create(
+                    workspace=ws,
+                    connection_type="github",
+                    connection_id=str(installation_id),
+                    **conn_defaults,
+                )
+        finally:
+            set_current_user(prev_user)
+            request.user = prev_request_user
+
+        return Response(
+            {"credential_id": str(cred.id), "connection_id": str(conn.id)},
+            status=status.HTTP_200_OK,
+        )
+
+
 class SiloSlackTeamContextEndpoint(BaseAPIView):
     """Resolve a Slack team_id to the Plane workspace and projects.
 

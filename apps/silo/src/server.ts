@@ -9,6 +9,7 @@ import helmet from "helmet";
 
 import { config } from "./config";
 import { callDjango } from "./django-client";
+import { githubOAuthRouter } from "./github/oauth";
 import { notificationsRouter } from "./notifications";
 import { slackChannelsRouter } from "./slack/channels";
 import { slackCommandsRouter } from "./slack/commands";
@@ -71,6 +72,7 @@ export function createApp(): Express {
   router.use(slackEventsRouter());
   router.use(slackChannelsRouter());
   router.use(notificationsRouter());
+  router.use(githubOAuthRouter());
 
   app.use(config.basePath, router);
   return app;

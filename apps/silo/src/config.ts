@@ -47,3 +47,29 @@ export const getSlackConfig = (): SlackProviderConfig => {
   if (!slackConfig) throw new Error("Slack config not loaded yet");
   return slackConfig;
 };
+
+export type GithubProviderConfig = {
+  appId: string;
+  appSlug: string;
+  clientId: string;
+  clientSecret: string;
+  webhookSecret: string;
+  privateKey: string;
+  oauthClientId: string;
+  oauthClientSecret: string;
+};
+
+let githubConfig: GithubProviderConfig | null = null;
+
+export const setGithubConfig = (g: GithubProviderConfig): void => {
+  githubConfig = g;
+};
+
+export const getGithubConfig = (): GithubProviderConfig => {
+  if (!githubConfig) {
+    throw new Error("GitHub config not loaded — run the manifest flow at /silo/api/github/manifest");
+  }
+  return githubConfig;
+};
+
+export const isGithubConfigured = (): boolean => githubConfig !== null;

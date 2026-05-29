@@ -7,6 +7,7 @@ from django.urls import path
 from .views import (
     SiloAddAssigneeEndpoint,
     SiloChangeStateEndpoint,
+    SiloGithubInstallEndpoint,
     SiloPingEndpoint,
     SiloCreateCommentEndpoint,
     SiloCreateWorkItemEndpoint,
@@ -40,6 +41,11 @@ urlpatterns = [
         "silo/slack/install/",
         SiloSlackInstallEndpoint.as_view(http_method_names=["post"]),
         name="silo-slack-install",
+    ),
+    path(
+        "silo/github/install/",
+        SiloGithubInstallEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-install",
     ),
     path(
         "silo/slack/team-context/",
