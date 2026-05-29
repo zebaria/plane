@@ -54,6 +54,14 @@ export class SiloIntegrationService extends APIService {
     return j.url;
   }
 
+  async getGithubUserAuthUrl(workspaceSlug: string, planeUserId: string): Promise<string> {
+    const url = `${SILO_URL}/api/github/user/auth/url?workspaceSlug=${encodeURIComponent(workspaceSlug)}&planeUserId=${encodeURIComponent(planeUserId)}`;
+    const r = await fetch(url, { credentials: "omit" });
+    if (!r.ok) throw new Error(`silo github user auth/url ${r.status}`);
+    const j = (await r.json()) as { url: string };
+    return j.url;
+  }
+
   async getSlackUserAuthUrl(workspaceSlug: string, planeUserId: string): Promise<string> {
     const url = `${SILO_URL}/api/slack/user/auth/url?workspaceSlug=${encodeURIComponent(workspaceSlug)}&planeUserId=${encodeURIComponent(planeUserId)}`;
     const r = await fetch(url, { credentials: "omit" });

@@ -18,6 +18,7 @@ export type SlackSecrets = {
 
 const envCfg = (env: string): { region: string; prefix: string } => {
   if (env === "prod") return { region: "us-west-2", prefix: "/prod" };
+  if (env === "local") return { region: "us-east-1", prefix: "/local" };
   return { region: "us-east-1", prefix: "/dev" };
 };
 

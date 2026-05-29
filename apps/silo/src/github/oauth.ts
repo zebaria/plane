@@ -98,6 +98,7 @@ export const githubOAuthRouter = (): Router => {
       res.status(400).type("text/plain").send("env must be one of: local, dev, prod");
       return;
     }
+    res.setHeader("Content-Security-Policy", "default-src 'self'; form-action https://github.com");
     res.type("html").send(renderManifestForm(env));
   });
 
