@@ -348,6 +348,123 @@ class SiloGithubInstallEndpoint(BaseAPIView):
         )
 
 
+class SiloGithubUserConnectEndpoint(BaseAPIView):
+    """Persist a per-user GitHub ↔ Plane mapping completed by silo.
+
+    Mirrors SiloSlackUserConnectEndpoint: silo runs the user-scope
+    OAuth dance against the per-env OAuth App, reads the GitHub
+    user_id and login, and posts here. We never persist the user's
+    OAuth access token — it's only needed at link time. The mapping
+    is keyed on (workspace, user, connection_type='github') and is
+    used purely for attribution at issue/comment-create time.
+
+    Requires the workspace-level GitHub App install to exist first
+    (the WorkspaceUserConnection FK to credential is non-null in the
+    schema). Reuses that credential — there's no per-user token to
+    keep separate, the OAuth App's role is purely identity-resolution
+    at link time.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import User
+
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        plane_user_id = data.get("plane_user_id")
+        github_user_id = data.get("github_user_id")
+        github_login = data.get("github_login") or ""
+        github_email = data.get("github_email") or ""
+
+        if not (slug and plane_user_id and github_user_id and github_login):
+            return Response(
+                {"detail": "workspace_slug, plane_user_id, github_user_id, github_login required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ws = get_object_or_404(Workspace, slug=slug)
+        user = get_object_or_404(User, pk=plane_user_id)
+
+        cred = WorkspaceCredential.objects.filter(workspace=ws, source="github").first()
+        if not cred:
+            return Response(
+                {"detail": "GitHub workspace not connected; install workspace-level first"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Reject if this github_user_id is already mapped to a different
+        # Plane user in this workspace — actor attribution downstream
+        # keys off github_user_id, so duplicate mappings would silently
+        # misattribute.
+        clash = (
+            WorkspaceUserConnection.objects.filter(
+                workspace=ws,
+                connection_type="github",
+                connection_id=str(github_user_id),
+            )
+            .exclude(user=user)
+            .first()
+        )
+        if clash:
+            return Response(
+                {"detail": "github_user_id already linked to another Plane user in this workspace"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        user_conn_defaults = {
+            "credential": cred,
+            "connection_id": str(github_user_id),
+            "connection_slug": github_login,
+            "connection_data": {
+                "github_login": github_login,
+                "github_email": github_email,
+            },
+            "scopes": [],
+            "config": {},
+            "deleted_at": None,
+        }
+
+        from crum import set_current_user, get_current_user
+        from django.db import transaction
+        prev_user = get_current_user()
+        prev_request_user = request.user
+        set_current_user(user)
+        request.user = user
+        try:
+            with transaction.atomic():
+                conn = WorkspaceUserConnection.objects.filter(
+                    workspace=ws, user=user, connection_type="github"
+                ).first()
+                if not conn:
+                    conn = (
+                        WorkspaceUserConnection.all_objects.filter(
+                            workspace=ws, user=user, connection_type="github"
+                        )
+                        .order_by("-deleted_at")
+                        .first()
+                    )
+                if conn:
+                    created = False
+                    for k, v in user_conn_defaults.items():
+                        setattr(conn, k, v)
+                    conn.save()
+                else:
+                    created = True
+                    conn = WorkspaceUserConnection.objects.create(
+                        workspace=ws, user=user, connection_type="github", **user_conn_defaults
+                    )
+        finally:
+            set_current_user(prev_user)
+            request.user = prev_request_user
+
+        return Response(
+            {"id": str(conn.id), "created": created},
+            status=status.HTTP_200_OK,
+        )
+
+
 class SiloSlackTeamContextEndpoint(BaseAPIView):
     """Resolve a Slack team_id to the Plane workspace and projects.
 

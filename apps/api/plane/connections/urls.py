@@ -8,6 +8,7 @@ from .views import (
     SiloAddAssigneeEndpoint,
     SiloChangeStateEndpoint,
     SiloGithubInstallEndpoint,
+    SiloGithubUserConnectEndpoint,
     SiloPingEndpoint,
     SiloCreateCommentEndpoint,
     SiloCreateWorkItemEndpoint,
@@ -46,6 +47,11 @@ urlpatterns = [
         "silo/github/install/",
         SiloGithubInstallEndpoint.as_view(http_method_names=["post"]),
         name="silo-github-install",
+    ),
+    path(
+        "silo/github/user-connect/",
+        SiloGithubUserConnectEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-user-connect",
     ),
     path(
         "silo/slack/team-context/",
