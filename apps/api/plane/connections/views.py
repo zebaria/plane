@@ -1184,7 +1184,6 @@ class SiloAddAssigneeEndpoint(BaseAPIView):
         issue_id = data.get("issue_id")
         actor_id = data.get("actor_user_id")
         slack_user_id = data.get("slack_user_id")
-        slack_team_id = data.get("slack_team_id")
 
         if not (slug and project_id and issue_id):
             return Response(
