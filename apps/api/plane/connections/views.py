@@ -245,6 +245,18 @@ class SiloGithubInstallEndpoint(BaseAPIView):
         ws = get_object_or_404(Workspace, slug=slug)
         installer = get_object_or_404(User, pk=installer_user_id)
 
+        # The HMAC channel proves the request came from silo, but the
+        # installer_user_id is just a value silo passed through from the
+        # browser flow — verify it actually belongs to a workspace admin
+        # before persisting anything against this workspace.
+        if not WorkspaceMember.objects.filter(
+            workspace=ws, member=installer, role=ROLE.ADMIN.value, is_active=True
+        ).exists():
+            return Response(
+                {"detail": "installer must be an active admin of the workspace"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         cred_defaults = {
             "user": installer,
             # GitHub App installation tokens are 1h-lived and minted on
@@ -261,69 +273,71 @@ class SiloGithubInstallEndpoint(BaseAPIView):
         }
 
         from crum import set_current_user, get_current_user
+        from django.db import transaction
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(installer)
         request.user = installer
         try:
-            cred = WorkspaceCredential.objects.filter(
-                workspace=ws, source="github", source_identifier=str(installation_id)
-            ).first()
-            if not cred:
-                cred = (
-                    WorkspaceCredential.all_objects.filter(
-                        workspace=ws, source="github", source_identifier=str(installation_id)
+            with transaction.atomic():
+                cred = WorkspaceCredential.objects.filter(
+                    workspace=ws, source="github", source_identifier=str(installation_id)
+                ).first()
+                if not cred:
+                    cred = (
+                        WorkspaceCredential.all_objects.filter(
+                            workspace=ws, source="github", source_identifier=str(installation_id)
+                        )
+                        .order_by("-deleted_at")
+                        .first()
                     )
-                    .order_by("-deleted_at")
-                    .first()
-                )
-            if cred:
-                for k, v in cred_defaults.items():
-                    setattr(cred, k, v)
-                cred.save()
-            else:
-                cred = WorkspaceCredential.objects.create(
-                    workspace=ws,
-                    source="github",
-                    source_identifier=str(installation_id),
-                    **cred_defaults,
-                )
+                if cred:
+                    for k, v in cred_defaults.items():
+                        setattr(cred, k, v)
+                    cred.save()
+                else:
+                    cred = WorkspaceCredential.objects.create(
+                        workspace=ws,
+                        source="github",
+                        source_identifier=str(installation_id),
+                        **cred_defaults,
+                    )
 
-            conn_defaults = {
-                "credential": cred,
-                "connection_slug": account_login,
-                "connection_data": {
-                    "account_login": account_login,
-                    "account_id": account_id,
-                    "account_type": account_type,
-                    "repository_selection": repository_selection,
-                },
-                "scopes": [],
-                "config": {},
-                "deleted_at": None,
-            }
-            conn = WorkspaceConnection.objects.filter(
-                workspace=ws, connection_type="github", connection_id=str(installation_id)
-            ).first()
-            if not conn:
-                conn = (
-                    WorkspaceConnection.all_objects.filter(
-                        workspace=ws, connection_type="github", connection_id=str(installation_id)
+                conn_defaults = {
+                    "credential": cred,
+                    "connection_slug": account_login,
+                    "connection_data": {
+                        "account_login": account_login,
+                        "account_id": account_id,
+                        "account_type": account_type,
+                        "repository_selection": repository_selection,
+                    },
+                    "scopes": [],
+                    "config": {},
+                    "deleted_at": None,
+                }
+                conn = WorkspaceConnection.objects.filter(
+                    workspace=ws, connection_type="github", connection_id=str(installation_id)
+                ).first()
+                if not conn:
+                    conn = (
+                        WorkspaceConnection.all_objects.filter(
+                            workspace=ws, connection_type="github", connection_id=str(installation_id)
+                        )
+                        .order_by("-deleted_at")
+                        .first()
                     )
-                    .order_by("-deleted_at")
-                    .first()
-                )
-            if conn:
-                for k, v in conn_defaults.items():
-                    setattr(conn, k, v)
-                conn.save()
-            else:
-                conn = WorkspaceConnection.objects.create(
-                    workspace=ws,
-                    connection_type="github",
-                    connection_id=str(installation_id),
-                    **conn_defaults,
-                )
+                if conn:
+                    for k, v in conn_defaults.items():
+                        setattr(conn, k, v)
+                    conn.save()
+                else:
+                    conn = WorkspaceConnection.objects.create(
+                        workspace=ws,
+                        connection_type="github",
+                        connection_id=str(installation_id),
+                        **conn_defaults,
+                    )
         finally:
             set_current_user(prev_user)
             request.user = prev_request_user
