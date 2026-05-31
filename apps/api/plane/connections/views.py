@@ -947,8 +947,13 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
             request.user = actor
             try:
                 # update_fields keeps the write tight; _sync_completed_at
-                # adds completed_at to the set when state changes.
-                issue.save(update_fields=list(updates.keys()))
+                # adds completed_at to the set when state changes. Map the
+                # `state_id` attname to the `state` field name — this
+                # Django version accepts either, but `state` is the
+                # canonical field name and avoids any version-dependent
+                # update_fields validation surprises.
+                update_fields = [("state" if f == "state_id" else f) for f in updates]
+                issue.save(update_fields=update_fields)
             finally:
                 set_current_user(prev_user)
                 request.user = prev_request_user
