@@ -25,16 +25,37 @@ import json
 import time
 
 import pytest
+from django.core.cache import cache
+from django.utils import timezone
 
 from plane.connections.models import (
     WorkspaceConnection,
     WorkspaceCredential,
     WorkspaceEntityConnection,
 )
-from plane.db.models import Project, ProjectMember
+from plane.db.models import (
+    Issue,
+    IssueComment,
+    Project,
+    ProjectMember,
+    State,
+    Workspace,
+    WorkspaceMember,
+)
 
 
 SECRET = "contract-test-silo-secret"
+
+
+@pytest.fixture(autouse=True)
+def _reset_throttle_cache():
+    # Silo endpoints inherit the global AnonRateThrottle (30/min), and
+    # its counter lives in the Redis cache, which persists across tests
+    # AND across pytest runs. Without clearing it, a module with >30
+    # requests/min starts 429-ing partway through (and stays poisoned on
+    # the next run). Clear before each test so throttling can't bleed in.
+    cache.clear()
+    yield
 
 
 def _sign(method: str, path: str, body: bytes) -> dict:
@@ -104,7 +125,6 @@ def repo_binding(db, project, github_workspace_connection):
 @pytest.mark.contract
 class TestRepoBindingsOutboundLookup:
     """Phase 4e: lookup by (workspace_slug, project_id) — outbound starts
-    from a Plane work-item event, not a GH webhook, so it doesn't have
     installation_id."""
 
     PATH = "/api/v1/silo/github/repo-bindings/"
@@ -171,7 +191,6 @@ class TestIssueLinkLookupByPlaneIssueId:
         )
 
     def test_lookup_by_plane_issue_id(self, db, api_client, settings, project, github_workspace_connection):
-        from plane.db.models import Issue, State
 
         state = State.objects.create(
             name="Backlog", workspace=project.workspace, project=project, group="backlog"
@@ -214,7 +233,6 @@ class TestIssueLinkPlaneCommentMap:
     def test_plane_comment_map_merged(
         self, db, api_client, settings, project, github_workspace_connection
     ):
-        from plane.db.models import Issue, State
 
         state = State.objects.create(
             name="Backlog", workspace=project.workspace, project=project, group="backlog"
@@ -274,7 +292,6 @@ class TestIssueLinkPlaneCommentMap:
     def test_gh_and_plane_comment_maps_coexist(
         self, db, api_client, settings, project, github_workspace_connection
     ):
-        from plane.db.models import Issue, State
 
         state = State.objects.create(
             name="Backlog", workspace=project.workspace, project=project, group="backlog"
@@ -356,7 +373,6 @@ class TestCreateWorkItemDescriptionHtml:
         )
         assert r.status_code in (200, 201), r.content
 
-        from plane.db.models import Issue
 
         issue = Issue.objects.get(pk=r.json()["id"])
         # Tags must NOT be HTML-escaped — GH path passes already-HTML.
@@ -383,7 +399,6 @@ class TestCreateWorkItemDescriptionHtml:
         )
         assert r.status_code in (200, 201), r.content
 
-        from plane.db.models import Issue
 
         issue = Issue.objects.get(pk=r.json()["id"])
         # Tags escaped, wrapped in <p>.
@@ -546,7 +561,6 @@ class TestIssueLinkOwnershipScoping:
     LINK_PATH = "/api/v1/silo/github/issue-link/"
 
     def _issue_in(self, project):
-        from plane.db.models import Issue, State
 
         state = State.objects.create(
             name="Backlog", workspace=project.workspace, project=project, group="backlog"
@@ -558,7 +572,6 @@ class TestIssueLinkOwnershipScoping:
     def test_foreign_project_id_rejected(
         self, db, api_client, settings, project, github_workspace_connection, create_user
     ):
-        from plane.db.models import Workspace, WorkspaceMember
 
         other_ws = Workspace.objects.create(
             name="Other", owner=create_user, slug="other-ws"
@@ -621,7 +634,6 @@ class TestCommentUpdateScoping:
     PATH = "/api/v1/silo/comments/update/"
 
     def _comment(self, project):
-        from plane.db.models import Issue, IssueComment, State
 
         state = State.objects.create(
             name="Backlog", workspace=project.workspace, project=project, group="backlog"
@@ -663,7 +675,6 @@ class TestCommentUpdateScoping:
         assert comment.comment_html == "<p>edited</p>"
 
     def test_wrong_issue_id_is_noop_missing(self, db, api_client, settings, project):
-        from plane.db.models import IssueComment
 
         issue, comment = self._comment(project)
         del issue
@@ -747,3 +758,77 @@ class TestReposChangedMerge:
         github_workspace_connection.refresh_from_db()
         ids = {r["id"] for r in github_workspace_connection.connection_data["repositories"]}
         assert ids == {"2"}
+
+
+@pytest.mark.contract
+class TestUpdateWorkItemCompletedAt:
+    """Post-review fix: the work-item update endpoint must go through
+    issue.save() (not queryset .update()) so the model's
+    _sync_completed_at hook fires. Otherwise a GH-driven close never
+    stamps completed_at, and a reopen never clears it.
+    """
+
+    PATH = "/api/v1/silo/work-items/update/"
+
+    def _issue_with_states(self, project):
+
+        backlog = State.objects.create(
+            name="Backlog", workspace=project.workspace, project=project, group="backlog"
+        )
+        done = State.objects.create(
+            name="Done", workspace=project.workspace, project=project, group="completed"
+        )
+        issue = Issue.objects.create(
+            name="WI", workspace=project.workspace, project=project, state=backlog
+        )
+        return issue, backlog, done
+
+    def test_move_to_completed_stamps_completed_at(
+        self, db, api_client, settings, project, github_credential
+    ):
+        del github_credential  # actor fallback for the endpoint
+        issue, _backlog, done = self._issue_with_states(project)
+        assert issue.completed_at is None
+
+        r = _post_silo(
+            api_client,
+            settings,
+            self.PATH,
+            {
+                "workspace_slug": project.workspace.slug,
+                "project_id": str(project.id),
+                "issue_id": str(issue.id),
+                "state_id": str(done.id),
+            },
+        )
+        assert r.status_code == 200, r.content
+        issue.refresh_from_db()
+        # The whole point of the fix: _sync_completed_at ran on save.
+        assert issue.completed_at is not None
+
+    def test_reopen_clears_completed_at(
+        self, db, api_client, settings, project, github_credential
+    ):
+        del github_credential
+
+        issue, backlog, done = self._issue_with_states(project)
+        # Start already-completed so the reopen has something to clear.
+        issue.state = done
+        issue.completed_at = timezone.now()
+        issue.save()
+        assert issue.completed_at is not None
+
+        r = _post_silo(
+            api_client,
+            settings,
+            self.PATH,
+            {
+                "workspace_slug": project.workspace.slug,
+                "project_id": str(project.id),
+                "issue_id": str(issue.id),
+                "state_id": str(backlog.id),
+            },
+        )
+        assert r.status_code == 200, r.content
+        issue.refresh_from_db()
+        assert issue.completed_at is None

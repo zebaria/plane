@@ -30,9 +30,11 @@ import time
 import uuid
 
 import requests
+from bs4 import BeautifulSoup, Comment, NavigableString
 from celery import shared_task
 from django.conf import settings
 
+from plane.bgtasks.notification_task import extract_comment_mentions, extract_mentions
 from plane.connections.models import WorkspaceEntityConnection, WorkspaceUserConnection
 from plane.db.models import Issue, IssueComment, Project, State, User
 
@@ -139,7 +141,6 @@ def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -
     comment body can't be parsed as Slack formatting; the mention
     tokens we emit stay literal.
     """
-    from bs4 import BeautifulSoup, Comment, NavigableString
 
     if comment is None:
         return ""
@@ -217,7 +218,6 @@ def _gh_mention_map(htmls: list[str], workspace_id: str) -> dict[str, str]:
     `connect github account` UI) end up in the map; everyone else
     falls back to display-name rendering on the silo side.
     """
-    from bs4 import BeautifulSoup
 
     raw_ids: set[str] = set()
     for html in htmls:
@@ -315,9 +315,12 @@ def dispatch_silo_work_item_event(
             workspace_connection__deleted_at__isnull=True,
             workspace_connection__credential__deleted_at__isnull=True,
         )
-        if not mappings_qs.exists():
-            return
+        # One query: materialize the live mapping types and treat an
+        # empty set as "no mappings, nothing to dispatch" — saves the
+        # extra .exists() roundtrip.
         live_mapping_types = set(mappings_qs.values_list("type", flat=True))
+        if not live_mapping_types:
+            return
 
         try:
             project = Project.objects.select_related("workspace").get(pk=project_id)
@@ -446,13 +449,11 @@ def dispatch_silo_work_item_event(
 
             html = req.get("description_html")
             if html:
-                from plane.bgtasks.notification_task import extract_mentions
                 # extract_mentions takes a JSON string of the instance
                 for uid in extract_mentions(json.dumps({"description_html": html})):
                     affected_plane_user_ids.add(str(uid))
 
         if event_type == "work_item.commented" and comment is not None:
-            from plane.bgtasks.notification_task import extract_comment_mentions
             for uid in extract_comment_mentions(comment.comment_html or ""):
                 affected_plane_user_ids.add(str(uid))
 

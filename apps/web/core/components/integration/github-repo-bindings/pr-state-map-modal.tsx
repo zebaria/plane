@@ -106,30 +106,32 @@ export const PrStateMapModal = observer(function PrStateMapModal({
     }
   }, [projectIdForStates, workspaceSlug, stateStore]);
 
+  // Computed inline (not useMemo) so the mobx observer recomputes when
+  // the underlying observables change — `getProjectStates` populates
+  // asynchronously after the fetch below, and a useMemo keyed on the
+  // (stable) store refs would never see it, leaving the dropdown empty.
+  //
   // For workspace scope, pull all workspace states (one fetch covers
   // every project); for project scope, the project-states list is fine.
-  const stateOptions = useMemo(() => {
-    if (scope === "workspace") {
-      // The workspace-default map writes the *same* state id everywhere,
-      // which is wrong if states aren't shared across projects. Plane
-      // doesn't share states across projects, so the only sensible
-      // workspace-default behavior is to leave the dropdowns empty
-      // and require per-project overrides. We keep a single picker
-      // showing all states across all projects (grouped), but the user
-      // is expected to use it only when their projects mirror the same
-      // state machine (the common case for small workspaces).
-      return projectStore.joinedProjectIds.flatMap((pid) => {
-        const proj = projectStore.getProjectById(pid);
-        const states = stateStore.getProjectStates(pid) ?? [];
-        return states.map((s) => ({
+  // The workspace-default map writes the *same* state id everywhere,
+  // which is wrong if states aren't shared across projects. Plane
+  // doesn't share states across projects, so the workspace-default
+  // picker shows all states across all projects (grouped), expected to
+  // be used only when projects mirror the same state machine.
+  const stateOptions =
+    scope === "workspace"
+      ? projectStore.joinedProjectIds.flatMap((pid) => {
+          const proj = projectStore.getProjectById(pid);
+          const states = stateStore.getProjectStates(pid) ?? [];
+          return states.map((s) => ({
+            id: s.id,
+            label: `${proj?.name ?? "?"} · ${s.name} (${s.group})`,
+          }));
+        })
+      : (stateStore.getProjectStates(scope.projectId) ?? []).map((s) => ({
           id: s.id,
-          label: `${proj?.name ?? "?"} · ${s.name} (${s.group})`,
+          label: `${s.name} (${s.group})`,
         }));
-      });
-    }
-    const states = stateStore.getProjectStates(scope.projectId) ?? [];
-    return states.map((s) => ({ id: s.id, label: `${s.name} (${s.group})` }));
-  }, [scope, stateStore, projectStore]);
 
   // For workspace-scope, eagerly fetch states for each project so the
   // grouped dropdown actually populates. Cheap (one cached call per
