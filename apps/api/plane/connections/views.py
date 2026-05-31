@@ -915,11 +915,15 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
         # the silo HMAC principal is anonymous, so set the thread-local
         # to `actor` and reset in `finally` to avoid leaking crum state
         # into another request on the same worker.
-        # Snapshot the pre-update state so the activity tracker can diff
-        # it (track_state dereferences current_instance — passing None
+        # Snapshot the pre-update values so the activity tracker can diff
+        # them (track_state dereferences current_instance — passing None
         # makes it crash, which the try/except below would silently
-        # swallow, losing the state-change activity row).
+        # swallow, losing the state-change activity row). Capturing name
+        # + description_html too lets the activity log record the real
+        # old_value instead of None on title/body edits.
         prev_state_id = str(issue.state_id) if issue.state_id else None
+        prev_name = issue.name
+        prev_description_html = issue.description_html
 
         updates = {}
         if "name" in data and data["name"] is not None:
@@ -1001,9 +1005,16 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
                 actor_id=str(actor.id),
                 issue_id=str(issue.id),
                 project_id=str(project.id),
-                # Pre-update snapshot so track_state can diff the state
-                # transition instead of dereferencing None.
-                current_instance=_json.dumps({"state_id": prev_state_id}),
+                # Pre-update snapshot so the trackers diff against the
+                # real old values instead of dereferencing None / logging
+                # None as old_value.
+                current_instance=_json.dumps(
+                    {
+                        "state_id": prev_state_id,
+                        "name": prev_name,
+                        "description_html": prev_description_html,
+                    }
+                ),
                 epoch=int(_tz.now().timestamp()),
                 notification=True,
             )
