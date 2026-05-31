@@ -924,6 +924,16 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
         prev_state_id = str(issue.state_id) if issue.state_id else None
         prev_name = issue.name
         prev_description_html = issue.description_html
+        # Pre-update assignee/label ids: fed to the activity tracker as
+        # old_value AND reused as the "existing" set for the M2M diff
+        # below (so we don't re-query). track_assignees / track_labels
+        # read these from current_instance.
+        prev_assignee_ids = [
+            str(x) for x in IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
+        ]
+        prev_label_ids = [
+            str(x) for x in IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True)
+        ]
 
         updates = {}
         if "name" in data and data["name"] is not None:
@@ -961,10 +971,7 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
         # Assignees + labels are M2M; replace the full set if provided.
         if "assignee_ids" in data and isinstance(data["assignee_ids"], list):
             new_ids = {str(x) for x in data["assignee_ids"]}
-            existing = set(
-                IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
-            )
-            existing = {str(x) for x in existing}
+            existing = set(prev_assignee_ids)
             to_add = new_ids - existing
             to_remove = existing - new_ids
             for uid in to_add:
@@ -981,10 +988,7 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
 
         if "label_ids" in data and isinstance(data["label_ids"], list):
             new_ids = {str(x) for x in data["label_ids"]}
-            existing = set(
-                IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True)
-            )
-            existing = {str(x) for x in existing}
+            existing = set(prev_label_ids)
             to_add = new_ids - existing
             to_remove = existing - new_ids
             for lid in to_add:
@@ -999,11 +1003,25 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
             if to_remove:
                 IssueLabel.objects.filter(issue=issue, label_id__in=to_remove).delete()
 
-        # Mirror the activity hook so notification fan-out runs.
+        # Mirror the activity hook so notification fan-out runs. Both the
+        # requested (new) and current_instance (old) payloads must carry
+        # every changed field — track_assignees / track_labels read
+        # assignee_ids / label_ids from BOTH, so omitting them on either
+        # side drops the activity row (labels) or logs an empty old_value
+        # (assignees).
         try:
             requested = {k: v for k, v in updates.items()}
-            if "assignee_ids" in data:
-                requested["assignee_ids"] = [str(x) for x in (data["assignee_ids"] or [])]
+            current_inst = {
+                "state_id": prev_state_id,
+                "name": prev_name,
+                "description_html": prev_description_html,
+            }
+            if "assignee_ids" in data and isinstance(data["assignee_ids"], list):
+                requested["assignee_ids"] = [str(x) for x in data["assignee_ids"]]
+                current_inst["assignee_ids"] = prev_assignee_ids
+            if "label_ids" in data and isinstance(data["label_ids"], list):
+                requested["label_ids"] = [str(x) for x in data["label_ids"]]
+                current_inst["label_ids"] = prev_label_ids
             issue_activity.delay(
                 type="issue.activity.updated",
                 requested_data=_json.dumps(requested),
@@ -1013,13 +1031,7 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
                 # Pre-update snapshot so the trackers diff against the
                 # real old values instead of dereferencing None / logging
                 # None as old_value.
-                current_instance=_json.dumps(
-                    {
-                        "state_id": prev_state_id,
-                        "name": prev_name,
-                        "description_html": prev_description_html,
-                    }
-                ),
+                current_instance=_json.dumps(current_inst),
                 epoch=int(_tz.now().timestamp()),
                 notification=True,
             )

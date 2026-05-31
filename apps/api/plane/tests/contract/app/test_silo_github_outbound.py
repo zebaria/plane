@@ -36,10 +36,14 @@ from plane.connections.models import (
 )
 from plane.db.models import (
     Issue,
+    IssueAssignee,
     IssueComment,
+    IssueLabel,
+    Label,
     Project,
     ProjectMember,
     State,
+    User,
     Workspace,
     WorkspaceMember,
 )
@@ -871,3 +875,57 @@ class TestUpdateWorkItemCompletedAt:
         assert issue.name == "renamed but still done"
         # The original timestamp must be intact, not overwritten with now().
         assert issue.completed_at == original_completed
+
+
+@pytest.mark.contract
+class TestUpdateWorkItemAssigneesLabels:
+    """Gemini #21: the endpoint diffs assignees/labels against the
+    pre-update snapshot (prev_assignee_ids / prev_label_ids). Verify the
+    M2M sets land correctly through that refactored path."""
+
+    PATH = "/api/v1/silo/work-items/update/"
+
+    def test_assignees_and_labels_replaced(
+        self, db, api_client, settings, project, create_user, github_credential
+    ):
+        del github_credential
+        state = State.objects.create(
+            name="Backlog", workspace=project.workspace, project=project, group="backlog"
+        )
+        issue = Issue.objects.create(
+            name="WI", workspace=project.workspace, project=project, state=state
+        )
+        # Seed one existing assignee + label so the diff has a "remove" side.
+        old_user = create_user
+        old_label = Label.objects.create(name="old", workspace=project.workspace, project=project)
+        IssueAssignee.objects.create(
+            assignee=old_user, issue=issue, project=project, workspace=project.workspace
+        )
+        IssueLabel.objects.create(
+            label=old_label, issue=issue, project=project, workspace=project.workspace
+        )
+        # New members to assign / label to add.
+        new_user = User.objects.create(email="new@wz.co", username="new", display_name="new")
+        new_label = Label.objects.create(name="new", workspace=project.workspace, project=project)
+
+        r = _post_silo(
+            api_client,
+            settings,
+            self.PATH,
+            {
+                "workspace_slug": project.workspace.slug,
+                "project_id": str(project.id),
+                "issue_id": str(issue.id),
+                "assignee_ids": [str(new_user.id)],
+                "label_ids": [str(new_label.id)],
+            },
+        )
+        assert r.status_code == 200, r.content
+        # Old set removed, new set applied — the diff used the pre-update
+        # snapshot, not a stale/empty "existing".
+        assignees = set(
+            IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
+        )
+        labels = set(IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True))
+        assert assignees == {new_user.id}
+        assert labels == {new_label.id}
