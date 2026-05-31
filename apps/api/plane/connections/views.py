@@ -33,6 +33,7 @@ import json as _json
 from datetime import timedelta
 
 from crum import get_current_user, set_current_user
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -946,6 +947,20 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
         # the same — that would clobber a historical completed_at with
         # now() on a title-only edit. Compare as strings to avoid it.
         if "state_id" in data and data["state_id"] and str(data["state_id"]) != (prev_state_id or ""):
+            # Validate the target state exists AND belongs to this project
+            # before applying — an unvalidated state_id could 500 on a
+            # malformed UUID or cross project boundaries with a foreign
+            # state. The ValidationError guard covers the malformed case
+            # (.filter(pk=<bad-uuid>) raises rather than returning empty).
+            try:
+                state_ok = State.objects.filter(pk=data["state_id"], project=project).exists()
+            except (ValidationError, ValueError):
+                state_ok = False
+            if not state_ok:
+                return Response(
+                    {"detail": "state_id is not valid for this project"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             updates["state_id"] = data["state_id"]
 
         if updates:
