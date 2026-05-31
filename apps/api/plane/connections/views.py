@@ -915,19 +915,24 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
         # the silo HMAC principal is anonymous, so set the thread-local
         # to `actor` and reset in `finally` to avoid leaking crum state
         # into another request on the same worker.
-        updates = {}
-        if "name" in data and data["name"] is not None:
-            updates["name"] = str(data["name"])[:255]
-        if "description_html" in data and data["description_html"] is not None:
-            updates["description_html"] = str(data["description_html"])
-        if "state_id" in data and data["state_id"]:
-            updates["state_id"] = data["state_id"]
-
         # Snapshot the pre-update state so the activity tracker can diff
         # it (track_state dereferences current_instance — passing None
         # makes it crash, which the try/except below would silently
         # swallow, losing the state-change activity row).
         prev_state_id = str(issue.state_id) if issue.state_id else None
+
+        updates = {}
+        if "name" in data and data["name"] is not None:
+            updates["name"] = str(data["name"])[:255]
+        if "description_html" in data and data["description_html"] is not None:
+            updates["description_html"] = str(data["description_html"])
+        # Only treat state as changed when it actually differs. issue.save
+        # → _sync_completed_at keys off has_changed("state_id"), which can
+        # read True from a string-vs-UUID mismatch even when the value is
+        # the same — that would clobber a historical completed_at with
+        # now() on a title-only edit. Compare as strings to avoid it.
+        if "state_id" in data and data["state_id"] and str(data["state_id"]) != (prev_state_id or ""):
+            updates["state_id"] = data["state_id"]
 
         if updates:
             for field, value in updates.items():

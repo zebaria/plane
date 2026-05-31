@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import json
 import time
+from datetime import timedelta
 
 import pytest
 from django.core.cache import cache
@@ -832,3 +833,41 @@ class TestUpdateWorkItemCompletedAt:
         assert r.status_code == 200, r.content
         issue.refresh_from_db()
         assert issue.completed_at is None
+
+    def test_title_edit_preserves_completed_at(
+        self, db, api_client, settings, project, github_credential
+    ):
+        # Gemini #21: a non-state edit (or a state re-send of the same
+        # value) must NOT re-run _sync_completed_at and clobber the
+        # historical completion timestamp. We pass the SAME state_id the
+        # issue already has, plus a new name — completed_at must survive.
+        del github_credential
+        issue, _backlog, done = self._issue_with_states(project)
+        # Put the issue in a completed state with a KNOWN historical
+        # timestamp. Set both via queryset .update() so the model's
+        # _sync_completed_at doesn't overwrite completed_at during setup
+        # (that hook is exactly what the endpoint must not re-trigger).
+        original_completed = timezone.now() - timedelta(days=3)
+        Issue.objects.filter(pk=issue.pk).update(
+            state=done, completed_at=original_completed
+        )
+        issue.refresh_from_db()
+        assert issue.completed_at == original_completed
+
+        r = _post_silo(
+            api_client,
+            settings,
+            self.PATH,
+            {
+                "workspace_slug": project.workspace.slug,
+                "project_id": str(project.id),
+                "issue_id": str(issue.id),
+                "name": "renamed but still done",
+                "state_id": str(done.id),  # unchanged — must be a no-op
+            },
+        )
+        assert r.status_code == 200, r.content
+        issue.refresh_from_db()
+        assert issue.name == "renamed but still done"
+        # The original timestamp must be intact, not overwritten with now().
+        assert issue.completed_at == original_completed
