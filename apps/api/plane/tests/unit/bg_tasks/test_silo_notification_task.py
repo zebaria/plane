@@ -22,7 +22,11 @@ import pytest
 from django.test import override_settings
 
 from plane.bgtasks.silo_notification_task import (
+    GITHUB_REPO_TYPE,
+    INTEGRATION_MAPPING_TYPES,
+    INTEGRATIONS,
     SLACK_NOTIFICATION_TYPE,
+    _gh_mention_map,
     _render_comment_for_slack,
     dispatch_silo_work_item_event,
 )
@@ -91,7 +95,12 @@ def slack_channel_mapping(db, project, slack_workspace_connection):
 def issue_factory(db, project, create_user, workspace):
     """Build issues bound to the test project with a state."""
 
-    def _build(name: str = "Test Issue", state_group: str = "backlog", priority: str = "none") -> Issue:
+    def _build(
+        name: str = "Test Issue",
+        state_group: str = "backlog",
+        priority: str = "none",
+        description_html: str = "",
+    ) -> Issue:
         state, _ = State.objects.get_or_create(
             name=state_group.title(),
             workspace=workspace,
@@ -104,6 +113,7 @@ def issue_factory(db, project, create_user, workspace):
             project=project,
             state=state,
             priority=priority,
+            description_html=description_html,
         )
         return i
 
@@ -402,3 +412,253 @@ class TestRenderCommentForSlack:
         )
         out = _render_comment_for_slack(comment, str(workspace.id))
         assert out == ""
+
+
+# ============================================================
+# INTEGRATIONS registry — Phase 4e
+# ============================================================
+
+
+@pytest.mark.unit
+class TestIntegrationsRegistry:
+    """The dispatcher fans out to whatever integrations have a live
+    mapping on the project. Adding a new integration should be one
+    tuple entry — no orchestrator branches. These tests pin the
+    contract so a refactor doesn't silently drop subscribers.
+    """
+
+    def test_registry_has_slack_and_github(self):
+        types = {i["mapping_type"] for i in INTEGRATIONS}
+        assert SLACK_NOTIFICATION_TYPE in types
+        assert GITHUB_REPO_TYPE in types
+
+    def test_integration_mapping_types_matches_registry(self):
+        # The flat tuple is what the existence-check filter uses; if
+        # it falls out of sync with the registry, the dispatcher
+        # silently stops fanning out to the missing type.
+        assert set(INTEGRATION_MAPPING_TYPES) == {i["mapping_type"] for i in INTEGRATIONS}
+
+    def test_each_integration_declares_event_subscription(self):
+        for i in INTEGRATIONS:
+            assert "events" in i
+            assert isinstance(i["events"], (tuple, list))
+            assert len(i["events"]) > 0
+
+    def test_github_subscribes_to_create_update_state_comment_completed(self):
+        gh = next(i for i in INTEGRATIONS if i["mapping_type"] == GITHUB_REPO_TYPE)
+        events = set(gh["events"])
+        # Outbound mirror needs all four lifecycle hooks. If we drop
+        # `work_item.updated` here the title/description edit path
+        # silently breaks on GitHub.
+        for required in (
+            "work_item.created",
+            "work_item.updated",
+            "work_item.state_changed",
+            "work_item.commented",
+            "work_item.completed",
+        ):
+            assert required in events, f"github integration missing {required}"
+
+
+@pytest.mark.unit
+class TestLiveMappingTypesPayload:
+    """Phase 4e payload: silo dispatchers self-gate on
+    `live_mapping_types`. The payload must list the types of mappings
+    actually live on the project, so the dispatcher knows whether to
+    run."""
+
+    def _captured(self, mock_post) -> dict:
+        assert mock_post.call_count == 1
+        return json.loads(mock_post.call_args.kwargs["data"])
+
+    def test_payload_includes_live_mapping_types(
+        self, db, project, slack_channel_mapping, issue_factory, create_user
+    ):
+        issue = issue_factory()
+        with patch("plane.bgtasks.silo_notification_task.requests.post") as mock_post:
+            mock_post.return_value.status_code = 200
+            dispatch_silo_work_item_event(
+                activity_type="issue.activity.created",
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                actor_id=str(create_user.id),
+            )
+        payload = self._captured(mock_post)
+        assert "live_mapping_types" in payload
+        assert SLACK_NOTIFICATION_TYPE in payload["live_mapping_types"]
+
+    def test_github_only_project_dispatches(
+        self, db, project, github_workspace_connection_for_test, issue_factory, create_user
+    ):
+        """A project bound only to a GitHub repo (no Slack channel
+        mapping) must still trigger the dispatch — the registry
+        existence check is `type__in=INTEGRATION_MAPPING_TYPES`,
+        not `type=SLACK_NOTIFICATION_TYPE`."""
+        WorkspaceEntityConnection.objects.create(
+            workspace=project.workspace,
+            workspace_connection=github_workspace_connection_for_test,
+            project=project,
+            type=GITHUB_REPO_TYPE,
+            entity_type="repository",
+            entity_id="999",
+            entity_slug="zebaria/plane",
+            config={"direction": "bi"},
+        )
+        issue = issue_factory()
+        with patch("plane.bgtasks.silo_notification_task.requests.post") as mock_post:
+            mock_post.return_value.status_code = 200
+            dispatch_silo_work_item_event(
+                activity_type="issue.activity.created",
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                actor_id=str(create_user.id),
+            )
+        payload = self._captured(mock_post)
+        assert GITHUB_REPO_TYPE in payload["live_mapping_types"]
+
+
+@pytest.mark.unit
+class TestGhMentionMap:
+    """Phase 4e followup: outbound's `@mention` rewrite needs a
+    plane_user_id → gh_login map in the payload. The helper builds it
+    by parsing `<mention-component>` tags out of the description and
+    comment html, then joining to WorkspaceUserConnection rows of
+    type=github."""
+
+    def _make_gh_user_conn(self, db, project, create_user, gh_login: str):
+        cred = WorkspaceCredential.objects.create(
+            workspace=project.workspace,
+            user=create_user,
+            source="github",
+            source_identifier="42",
+            source_access_token="ghs_fake",
+            is_pat=False,
+            is_active=True,
+        )
+        return WorkspaceUserConnection.objects.create(
+            workspace=project.workspace,
+            user=create_user,
+            credential=cred,
+            connection_type="github",
+            connection_id="999",
+            connection_slug=gh_login,
+        )
+
+    def test_returns_empty_when_no_mention_components(self, db, project):
+        out = _gh_mention_map(["<p>plain text</p>"], str(project.workspace_id))
+        assert out == {}
+
+    def test_returns_empty_when_no_mapped_user(self, db, project, create_user):
+        # mention exists but the Plane user has no github WorkspaceUserConnection
+        html = (
+            f'<p><mention-component entity_name="user_mention" '
+            f'entity_identifier="{create_user.id}">@Erik</mention-component></p>'
+        )
+        out = _gh_mention_map([html], str(project.workspace_id))
+        assert out == {}
+
+    def test_resolves_mapped_user_to_gh_login(self, db, project, create_user):
+        self._make_gh_user_conn(db, project, create_user, "alice-gh")
+        html = (
+            f'<p><mention-component entity_name="user_mention" '
+            f'entity_identifier="{create_user.id}">@Erik</mention-component></p>'
+        )
+        out = _gh_mention_map([html], str(project.workspace_id))
+        assert out == {str(create_user.id): "alice-gh"}
+
+    def test_ignores_non_user_mention_types(self, db, project, create_user):
+        self._make_gh_user_conn(db, project, create_user, "alice-gh")
+        html = (
+            f'<p><mention-component entity_name="project_mention" '
+            f'entity_identifier="{create_user.id}">#Proj</mention-component></p>'
+        )
+        out = _gh_mention_map([html], str(project.workspace_id))
+        assert out == {}
+
+    def test_ignores_invalid_uuids(self, db, project):
+        html = (
+            '<p><mention-component entity_name="user_mention" '
+            'entity_identifier="not-a-uuid">@x</mention-component></p>'
+        )
+        out = _gh_mention_map([html], str(project.workspace_id))
+        assert out == {}
+
+    def test_mention_map_in_payload_when_github_live(
+        self, db, project, github_workspace_connection_for_test, issue_factory, create_user
+    ):
+        # Bind GH so live_mapping_types contains github-repo
+        WorkspaceEntityConnection.objects.create(
+            workspace=project.workspace,
+            workspace_connection=github_workspace_connection_for_test,
+            project=project,
+            type=GITHUB_REPO_TYPE,
+            entity_type="repository",
+            entity_id="999",
+            entity_slug="zebaria/plane",
+            config={"direction": "bi"},
+        )
+        # Map create_user → gh login
+        TestGhMentionMap()._make_gh_user_conn(db, project, create_user, "alice-gh")
+
+        # Issue's description_html mentions the user
+        mention_html = (
+            f'<p><mention-component entity_name="user_mention" '
+            f'entity_identifier="{create_user.id}">@Erik</mention-component></p>'
+        )
+        issue = issue_factory(description_html=mention_html)
+        with patch("plane.bgtasks.silo_notification_task.requests.post") as mock_post:
+            mock_post.return_value.status_code = 200
+            dispatch_silo_work_item_event(
+                activity_type="issue.activity.created",
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                actor_id=str(create_user.id),
+            )
+        payload = json.loads(mock_post.call_args.kwargs["data"])
+        assert payload.get("mention_map") == {str(create_user.id): "alice-gh"}
+
+    def test_mention_map_empty_when_github_not_live(
+        self, db, project, slack_channel_mapping, issue_factory, create_user
+    ):
+        # Slack-only project — payload still has mention_map but it's
+        # empty (we don't pay the WorkspaceUserConnection query cost
+        # when no GH dispatcher will consume it).
+        TestGhMentionMap()._make_gh_user_conn(db, project, create_user, "alice-gh")
+        mention_html = (
+            f'<p><mention-component entity_name="user_mention" '
+            f'entity_identifier="{create_user.id}">@Erik</mention-component></p>'
+        )
+        issue = issue_factory(description_html=mention_html)
+        with patch("plane.bgtasks.silo_notification_task.requests.post") as mock_post:
+            mock_post.return_value.status_code = 200
+            dispatch_silo_work_item_event(
+                activity_type="issue.activity.created",
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                actor_id=str(create_user.id),
+            )
+        payload = json.loads(mock_post.call_args.kwargs["data"])
+        assert payload.get("mention_map") == {}
+
+
+@pytest.fixture
+def github_workspace_connection_for_test(db, project, create_user):
+    """A WorkspaceConnection of type=github so we can attach a
+    github-repo entity mapping to the project for the registry tests
+    without touching the Slack fixtures."""
+    cred = WorkspaceCredential.objects.create(
+        workspace=project.workspace,
+        user=create_user,
+        source="github",
+        source_identifier="42",
+        source_access_token="ghs_fake",
+        is_pat=False,
+        is_active=True,
+    )
+    return WorkspaceConnection.objects.create(
+        workspace=project.workspace,
+        credential=cred,
+        connection_type="github",
+        connection_id="42",
+        connection_slug="zebaria",
+    )

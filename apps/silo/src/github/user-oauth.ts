@@ -24,11 +24,15 @@ import express from "express";
 import { config, getGithubConfig } from "../config";
 import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
+import { apiBaseFor, oauthAccessTokenUrlFor, oauthAuthorizeUrlFor, validateGhesOrigin } from "./host";
 
 const USER_SCOPES = ["read:user", "user:email"];
 const STATE_TTL_MS = 10 * 60 * 1000;
 
-type StateEntry = { workspaceSlug: string; planeUserId: string; createdAt: number };
+// Phase 4g: ghesBaseUrl empty/undefined → cloud github.com. When set,
+// the authorize redirect, code exchange, and /user reads all swap to
+// the customer's GHES origin (and <host>/api/v3 for the API calls).
+type StateEntry = { workspaceSlug: string; planeUserId: string; ghesBaseUrl?: string; createdAt: number };
 const stateStore = new Map<string, StateEntry>();
 
 setInterval(() => {
@@ -38,9 +42,9 @@ setInterval(() => {
   }
 }, STATE_TTL_MS).unref();
 
-const issueState = (workspaceSlug: string, planeUserId: string): string => {
+const issueState = (workspaceSlug: string, planeUserId: string, ghesBaseUrl?: string): string => {
   const token = randomBytes(24).toString("hex");
-  stateStore.set(token, { workspaceSlug, planeUserId, createdAt: Date.now() });
+  stateStore.set(token, { workspaceSlug, planeUserId, ghesBaseUrl, createdAt: Date.now() });
   return token;
 };
 
@@ -54,9 +58,9 @@ const consumeState = (token: string): StateEntry | null => {
 
 const userRedirectUrl = (): string => `${config.publicBaseUrl}${config.basePath}/api/github/auth/user/callback`;
 
-const buildAuthorizeUrl = (state: string): string => {
+const buildAuthorizeUrl = (state: string, ghesBaseUrl?: string): string => {
   const cfg = getGithubConfig();
-  const url = new URL("https://github.com/login/oauth/authorize");
+  const url = new URL(oauthAuthorizeUrlFor(ghesBaseUrl));
   url.searchParams.set("client_id", cfg.oauthClientId);
   url.searchParams.set("scope", USER_SCOPES.join(" "));
   url.searchParams.set("redirect_uri", userRedirectUrl());
@@ -69,10 +73,10 @@ type GhTokenResponse = { access_token?: string; scope?: string; token_type?: str
 type GhUser = { id: number; login: string; email: string | null };
 type GhEmail = { email: string; primary: boolean; verified: boolean };
 
-const exchangeCode = async (code: string): Promise<GhTokenResponse> => {
+const exchangeCode = async (code: string, ghesBaseUrl?: string): Promise<GhTokenResponse> => {
   const cfg = getGithubConfig();
   const r = await axios.post<GhTokenResponse>(
-    "https://github.com/login/oauth/access_token",
+    oauthAccessTokenUrlFor(ghesBaseUrl),
     {
       client_id: cfg.oauthClientId,
       client_secret: cfg.oauthClientSecret,
@@ -84,8 +88,8 @@ const exchangeCode = async (code: string): Promise<GhTokenResponse> => {
   return r.data;
 };
 
-const fetchUser = async (token: string): Promise<GhUser> => {
-  const r = await axios.get<GhUser>("https://api.github.com/user", {
+const fetchUser = async (token: string, ghesBaseUrl?: string): Promise<GhUser> => {
+  const r = await axios.get<GhUser>(`${apiBaseFor(ghesBaseUrl)}/user`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
     validateStatus: () => true,
   });
@@ -93,10 +97,10 @@ const fetchUser = async (token: string): Promise<GhUser> => {
   return r.data;
 };
 
-const fetchPrimaryEmail = async (token: string): Promise<string> => {
+const fetchPrimaryEmail = async (token: string, ghesBaseUrl?: string): Promise<string> => {
   // /user.email is null for users who hide their email; fall back to
   // the verified primary from /user/emails (requires user:email scope).
-  const r = await axios.get<GhEmail[]>("https://api.github.com/user/emails", {
+  const r = await axios.get<GhEmail[]>(`${apiBaseFor(ghesBaseUrl)}/user/emails`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
     validateStatus: () => true,
   });
@@ -132,13 +136,22 @@ export const githubUserOAuthRouter = (): Router => {
       res.status(400).json({ error: "workspaceSlug and planeUserId required" });
       return;
     }
+    // GHES origin (e.g. "https://ghe.acme.com"). Empty/absent → cloud.
+    // SSRF-guarded: this origin later receives the OAuth code exchange
+    // and /user reads, so it must be on the operator allowlist.
+    const ghesCheck = validateGhesOrigin(req.query.ghesBaseUrl as string | undefined, config.githubGhesAllowedHosts);
+    if (!ghesCheck.ok) {
+      res.status(400).json({ error: ghesCheck.error });
+      return;
+    }
+    const ghesBaseUrl = ghesCheck.origin;
     const cfg = getGithubConfig();
     if (!cfg.oauthClientId) {
       res.status(503).json({ error: "github oauth app not configured (missing /<env>/plane-github-oauth)" });
       return;
     }
-    const state = issueState(workspaceSlug, planeUserId);
-    res.json({ url: buildAuthorizeUrl(state) });
+    const state = issueState(workspaceSlug, planeUserId, ghesBaseUrl);
+    res.json({ url: buildAuthorizeUrl(state, ghesBaseUrl) });
   });
 
   r.get(
@@ -167,14 +180,14 @@ export const githubUserOAuthRouter = (): Router => {
         return;
       }
 
-      const tok = await exchangeCode(code);
+      const tok = await exchangeCode(code, entry.ghesBaseUrl);
       if (!tok.access_token) {
         res.redirect(errUrl(entry.workspaceSlug, tok.error ?? "exchange_failed"));
         return;
       }
       try {
-        const user = await fetchUser(tok.access_token);
-        const email = user.email ?? (await fetchPrimaryEmail(tok.access_token));
+        const user = await fetchUser(tok.access_token, entry.ghesBaseUrl);
+        const email = user.email ?? (await fetchPrimaryEmail(tok.access_token, entry.ghesBaseUrl));
         await persist(entry.workspaceSlug, entry.planeUserId, String(user.id), user.login, email);
       } catch (err) {
         res.redirect(errUrl(entry.workspaceSlug, `persist_failed:${(err as Error).message}`));

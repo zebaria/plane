@@ -10,7 +10,9 @@ import helmet from "helmet";
 import { config } from "./config";
 import { callDjango } from "./django-client";
 import { githubOAuthRouter } from "./github/oauth";
+import { githubReposRouter } from "./github/repos";
 import { githubUserOAuthRouter } from "./github/user-oauth";
+import { githubWebhookRouter } from "./github/webhook";
 import { notificationsRouter } from "./notifications";
 import { slackChannelsRouter } from "./slack/channels";
 import { slackCommandsRouter } from "./slack/commands";
@@ -31,16 +33,18 @@ export function createApp(): Express {
       credentials: false,
     })
   );
-  // Slack webhook routes need the raw body for HMAC verification. The
+  // Webhook routes need the raw body for HMAC verification. The
   // per-route `express.raw()` middleware in slack/{commands,interactions,events}.ts
-  // can only see a Buffer if the body hasn't been consumed yet — so
-  // skip the global JSON parser on those paths. Each Slack route
-  // handler installs its own raw parser scoped to its content-type.
+  // and github/webhook.ts can only see a Buffer if the body hasn't
+  // been consumed yet — so skip the global JSON parser on those
+  // paths. Each route handler installs its own raw parser scoped to
+  // its content-type.
   const SLACK_RAW_PATHS = new Set([
     `${config.basePath}/api/slack/commands`,
     `${config.basePath}/api/slack/interactions`,
     `${config.basePath}/api/slack/events`,
     `${config.basePath}/api/notifications/work-item-event`,
+    `${config.basePath}/api/github-webhook`,
   ]);
   const jsonParser = express.json({ limit: "5mb" });
   app.use((req, res, next) => {
@@ -75,6 +79,8 @@ export function createApp(): Express {
   router.use(notificationsRouter());
   router.use(githubOAuthRouter());
   router.use(githubUserOAuthRouter());
+  router.use(githubReposRouter());
+  router.use(githubWebhookRouter());
 
   app.use(config.basePath, router);
   return app;

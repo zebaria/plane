@@ -7,11 +7,19 @@ from django.urls import path
 from .views import (
     SiloAddAssigneeEndpoint,
     SiloChangeStateEndpoint,
+    SiloGithubInstallBelongsEndpoint,
     SiloGithubInstallEndpoint,
+    SiloGithubInstallLifecycleEndpoint,
+    SiloGithubIssueLinkEndpoint,
+    SiloGithubIssueLinkLookupEndpoint,
+    SiloGithubPrStateMapEndpoint,
+    SiloGithubRepoBindingsEndpoint,
     SiloGithubUserConnectEndpoint,
     SiloPingEndpoint,
     SiloCreateCommentEndpoint,
     SiloCreateWorkItemEndpoint,
+    SiloUpdateCommentEndpoint,
+    SiloUpdateWorkItemEndpoint,
     SiloProjectMappingsEndpoint,
     SiloProjectMetadataEndpoint,
     SiloSlackInstallEndpoint,
@@ -54,6 +62,36 @@ urlpatterns = [
         name="silo-github-user-connect",
     ),
     path(
+        "silo/github/install-belongs/",
+        SiloGithubInstallBelongsEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-install-belongs",
+    ),
+    path(
+        "silo/github/repo-bindings/",
+        SiloGithubRepoBindingsEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-repo-bindings",
+    ),
+    path(
+        "silo/github/issue-link/",
+        SiloGithubIssueLinkEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-issue-link",
+    ),
+    path(
+        "silo/github/issue-link/lookup/",
+        SiloGithubIssueLinkLookupEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-issue-link-lookup",
+    ),
+    path(
+        "silo/github/pr-state-map/",
+        SiloGithubPrStateMapEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-pr-state-map",
+    ),
+    path(
+        "silo/github/install-lifecycle/",
+        SiloGithubInstallLifecycleEndpoint.as_view(http_method_names=["post"]),
+        name="silo-github-install-lifecycle",
+    ),
+    path(
         "silo/slack/team-context/",
         SiloSlackTeamContextEndpoint.as_view(http_method_names=["post"]),
         name="silo-slack-team-context",
@@ -92,6 +130,16 @@ urlpatterns = [
         "silo/work-items/",
         SiloCreateWorkItemEndpoint.as_view(http_method_names=["post"]),
         name="silo-create-work-item",
+    ),
+    path(
+        "silo/work-items/update/",
+        SiloUpdateWorkItemEndpoint.as_view(http_method_names=["post"]),
+        name="silo-update-work-item",
+    ),
+    path(
+        "silo/comments/update/",
+        SiloUpdateCommentEndpoint.as_view(http_method_names=["post"]),
+        name="silo-update-comment",
     ),
     path(
         "silo/work-items/assignees/",

@@ -19,8 +19,7 @@ import { createSign, randomBytes } from "node:crypto";
 import axios, { type AxiosResponse } from "axios";
 
 import { getGithubConfig } from "../config";
-
-const GH_API = "https://api.github.com";
+import { apiBaseFor } from "./host";
 
 const b64url = (b: Buffer | string): string =>
   Buffer.from(b).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
@@ -40,10 +39,10 @@ const mintAppJwt = (): string => {
 type CachedToken = { token: string; expiresAt: number };
 const installationTokens = new Map<string, CachedToken>();
 
-const fetchInstallationToken = async (installationId: string): Promise<string> => {
+const fetchInstallationToken = async (installationId: string, ghesBaseUrl?: string | null): Promise<string> => {
   const jwt = mintAppJwt();
   const r = await axios.post<{ token: string; expires_at: string }>(
-    `${GH_API}/app/installations/${installationId}/access_tokens`,
+    `${apiBaseFor(ghesBaseUrl)}/app/installations/${installationId}/access_tokens`,
     {},
     {
       headers: { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json" },
@@ -56,11 +55,11 @@ const fetchInstallationToken = async (installationId: string): Promise<string> =
   return r.data.token;
 };
 
-export const getInstallationToken = async (installationId: string): Promise<string> => {
+export const getInstallationToken = async (installationId: string, ghesBaseUrl?: string | null): Promise<string> => {
   const now = Date.now();
   const cached = installationTokens.get(installationId);
   if (cached && cached.expiresAt > now) return cached.token;
-  const token = await fetchInstallationToken(installationId);
+  const token = await fetchInstallationToken(installationId, ghesBaseUrl);
   installationTokens.set(installationId, { token, expiresAt: now + 50 * 60 * 1000 });
   return token;
 };
@@ -72,12 +71,13 @@ export const invalidateInstallationToken = (installationId: string): void => {
 export const callGithubAsApp = async <T = unknown>(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
-  body?: unknown
+  body?: unknown,
+  ghesBaseUrl?: string | null
 ): Promise<AxiosResponse<T>> => {
   const jwt = mintAppJwt();
   return axios.request<T>({
     method,
-    url: `${GH_API}${path}`,
+    url: `${apiBaseFor(ghesBaseUrl)}${path}`,
     headers: {
       Authorization: `Bearer ${jwt}`,
       Accept: "application/vnd.github+json",
@@ -92,13 +92,14 @@ export const callGithub = async <T = unknown>(
   installationId: string,
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
-  body?: unknown
+  body?: unknown,
+  ghesBaseUrl?: string | null
 ): Promise<AxiosResponse<T>> => {
-  let token = await getInstallationToken(installationId);
+  let token = await getInstallationToken(installationId, ghesBaseUrl);
   const send = (): Promise<AxiosResponse<T>> =>
     axios.request<T>({
       method,
-      url: `${GH_API}${path}`,
+      url: `${apiBaseFor(ghesBaseUrl)}${path}`,
       headers: {
         Authorization: `token ${token}`,
         Accept: "application/vnd.github+json",
@@ -110,7 +111,7 @@ export const callGithub = async <T = unknown>(
   let r = await send();
   if (r.status === 401) {
     invalidateInstallationToken(installationId);
-    token = await getInstallationToken(installationId);
+    token = await getInstallationToken(installationId, ghesBaseUrl);
     r = await send();
   }
   return r;
@@ -120,7 +121,8 @@ export const callGithub = async <T = unknown>(
 // real App credentials (App ID, client_id, client_secret, webhook_secret,
 // pem). This call uses only the temporary code as auth — no JWT yet.
 export const convertManifest = async (
-  code: string
+  code: string,
+  ghesBaseUrl?: string | null
 ): Promise<{
   id: number;
   slug: string;
@@ -131,7 +133,7 @@ export const convertManifest = async (
   html_url: string;
 }> => {
   const r = await axios.post(
-    `${GH_API}/app-manifests/${encodeURIComponent(code)}/conversions`,
+    `${apiBaseFor(ghesBaseUrl)}/app-manifests/${encodeURIComponent(code)}/conversions`,
     {},
     {
       headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },

@@ -26,6 +26,7 @@ import express from "express";
 
 import { config } from "./config";
 import { callDjango } from "./django-client";
+import { githubOutboundDispatcher } from "./github/outbound";
 import { callSlackApiForTeam } from "./slack/api";
 
 const NOTIFICATION_PATH = "/api/notifications/work-item-event";
@@ -58,18 +59,51 @@ type DmTarget = {
   slack_user_id: string;
 };
 
-type WorkItemEvent = {
-  event_type: "work_item.created" | "work_item.state_changed" | "work_item.commented" | "work_item.completed";
+export type WorkItemEvent = {
+  event_type:
+    | "work_item.created"
+    | "work_item.updated"
+    | "work_item.state_changed"
+    | "work_item.commented"
+    | "work_item.completed";
   activity_type: string;
   workspace_slug: string;
   workspace_id: string;
   project_id: string;
   project_identifier: string;
-  issue: IssuePayload | null;
+  // Integration mapping types live on the project (e.g.
+  // "slack-channel-notification", "github-repo"). Dispatchers gate
+  // themselves on this so we don't, say, build GH state for a
+  // Slack-only project.
+  live_mapping_types: string[];
+  issue:
+    | (IssuePayload & {
+        description_html?: string;
+        state_id?: string | null;
+        labels?: { id: string; name: string }[];
+      })
+    | null;
   actor: ActorPayload | null;
   comment_text: string | null;
+  comment?: { id: string; comment_html: string } | null;
   state_change: StateChangePayload | null;
   dm_targets: DmTarget[];
+  // Plane user_id → external login map used by integration-specific
+  // mention rewrites (currently only GitHub: rewrites
+  // `<mention-component>` tags into `@gh_login`). Empty / absent
+  // when no mapped users are mentioned in the event's html bodies.
+  mention_map?: Record<string, string>;
+};
+
+// A dispatcher decides whether it cares about an event (based on
+// live_mapping_types + event_type) and, if so, fans it out to its
+// integration's API. Each integration owns its own dispatcher.
+export type IntegrationDispatcher = {
+  name: string;
+  // The WorkspaceEntityConnection.type this dispatcher handles. Used
+  // for the gate against `live_mapping_types`.
+  mappingType: string;
+  dispatch: (event: WorkItemEvent, webBaseUrl: string) => Promise<void>;
 };
 
 type ProjectMapping = {
@@ -224,7 +258,10 @@ const fetchSlackChannelMappings = async (workspaceSlug: string, projectId: strin
   return (r.data.mappings ?? []).filter((m) => m.connection_type === "slack");
 };
 
-const dispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
+const slackDispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
+  // Slack-side message links MUST use a publicly resolvable URL —
+  // Slack's renderers click them. Caller already passes
+  // PLANE_PUBLIC_URL or fallback.
   const blocks = buildBlocks(event, webBaseUrl);
   const fallbackText = `${event.project_identifier}-${event.issue?.sequence_id ?? "?"}: ${event.issue?.name ?? ""}`;
 
@@ -330,6 +367,34 @@ const fetchSlackTeamIdForWorkspace = async (workspaceSlug: string): Promise<stri
   return r.data.mappings?.[0]?.connection_team_id ?? null;
 };
 
+// Slack dispatcher exposed via the registry. Adding a new integration
+// is a one-line registration here + a new module exporting an
+// `IntegrationDispatcher`. The orchestrator below stays untouched.
+const slackDispatcher: IntegrationDispatcher = {
+  name: "slack",
+  mappingType: "slack-channel-notification",
+  dispatch: slackDispatch,
+};
+
+const dispatchers: IntegrationDispatcher[] = [slackDispatcher, githubOutboundDispatcher];
+
+const runDispatchers = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
+  // Each integration gates itself on `live_mapping_types`. Run them in
+  // parallel — a slow GitHub call shouldn't block the Slack post, and
+  // a Slack post failure shouldn't block the GH mirror.
+  await Promise.all(
+    dispatchers
+      .filter((d) => event.live_mapping_types?.includes(d.mappingType))
+      .map(async (d) => {
+        try {
+          await d.dispatch(event, webBaseUrl);
+        } catch (err) {
+          console.error(`[silo] dispatcher ${d.name} crashed:`, err);
+        }
+      })
+  );
+};
+
 export const notificationsRouter = (): Router => {
   const r = express.Router();
 
@@ -369,7 +434,7 @@ export const notificationsRouter = (): Router => {
     // tunnel/ALB hostname); fall back to WEB_BASE_URL for envs
     // where they're the same.
     const webBaseUrl = process.env.PLANE_PUBLIC_URL ?? process.env.WEB_BASE_URL ?? "http://localhost:3000";
-    dispatch(event, webBaseUrl).catch((err) => {
+    runDispatchers(event, webBaseUrl).catch((err) => {
       console.error("[silo] notifications dispatch crashed:", err);
     });
   });

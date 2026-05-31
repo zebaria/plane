@@ -18,6 +18,9 @@ import { useUser } from "@/hooks/store/user/user-user";
 import { useUserPermissions } from "@/hooks/store/user";
 import { SiloIntegrationService } from "@/services/integrations";
 
+import { GithubRepoBindingsRoot } from "./github-repo-bindings";
+import { normalizeGhesHost } from "./ghes-host";
+
 const silo = new SiloIntegrationService();
 
 const SWR_KEY = (slug: string) => `silo-connections-github:${slug}`;
@@ -31,6 +34,11 @@ export const SiloGithubCard = observer(function SiloGithubCard() {
 
   const [isInstalling, setIsInstalling] = useState(false);
   const [isUninstalling, setIsUninstalling] = useState(false);
+  // Phase 4g: GitHub Enterprise Server. When the admin reveals the
+  // enterprise option and enters a host, the install routes through
+  // that GHES origin instead of cloud github.com.
+  const [showEnterprise, setShowEnterprise] = useState(false);
+  const [ghesHost, setGhesHost] = useState("");
 
   const { data: connections } = useSWR(workspaceSlug ? SWR_KEY(String(workspaceSlug)) : null, () =>
     silo.listConnections(String(workspaceSlug), "github")
@@ -38,11 +46,11 @@ export const SiloGithubCard = observer(function SiloGithubCard() {
 
   const installed = connections && connections.length > 0 ? connections[0] : null;
 
-  const handleInstall = async () => {
+  const handleInstall = async (ghesBaseUrl?: string) => {
     if (!isAdmin || !currentUser) return;
     setIsInstalling(true);
     try {
-      const url = await silo.getGithubInstallUrl(String(workspaceSlug), currentUser.id);
+      const url = await silo.getGithubInstallUrl(String(workspaceSlug), currentUser.id, ghesBaseUrl);
       window.location.assign(url);
     } catch (e) {
       setIsInstalling(false);
@@ -52,6 +60,19 @@ export const SiloGithubCard = observer(function SiloGithubCard() {
         message: (e as Error).message,
       });
     }
+  };
+
+  const handleEnterpriseInstall = () => {
+    const host = normalizeGhesHost(ghesHost);
+    if (!host) {
+      setToast({
+        type: TOAST_TYPE.ERROR,
+        title: "Hostname required",
+        message: "Enter your GitHub Enterprise Server hostname, e.g. ghe.acme.com.",
+      });
+      return;
+    }
+    void handleInstall(host);
   };
 
   const handleUninstall = async () => {
@@ -101,11 +122,51 @@ export const SiloGithubCard = observer(function SiloGithubCard() {
             {isUninstalling ? "Disconnecting..." : "Disconnect"}
           </Button>
         ) : (
-          <Button variant="primary" onClick={handleInstall} disabled={!isAdmin} loading={isInstalling}>
+          <Button variant="primary" onClick={() => handleInstall()} disabled={!isAdmin} loading={isInstalling}>
             {isInstalling ? "Redirecting..." : "Connect"}
           </Button>
         )}
       </div>
+      {!installed && isAdmin ? (
+        <div className="-mt-2 px-4 pb-6">
+          {!showEnterprise ? (
+            <button
+              type="button"
+              onClick={() => setShowEnterprise(true)}
+              className="text-body-xs-regular text-secondary underline hover:text-primary"
+            >
+              Using GitHub Enterprise Server?
+            </button>
+          ) : (
+            <div className="flex flex-col gap-2 rounded-md border border-subtle bg-surface-2 p-3">
+              <label htmlFor="ghes-host" className="text-body-xs-medium">
+                GitHub Enterprise Server hostname
+              </label>
+              <p className="text-body-xs-regular text-secondary">
+                Enter your GHES origin (e.g. <code>ghe.acme.com</code>). The install and all API calls route to that
+                host instead of github.com.
+              </p>
+              <div className="flex items-center gap-2">
+                <input
+                  id="ghes-host"
+                  type="text"
+                  value={ghesHost}
+                  onChange={(e) => setGhesHost(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleEnterpriseInstall();
+                  }}
+                  placeholder="ghe.acme.com"
+                  className="focus:border-primary flex-1 rounded-md border border-subtle bg-surface-1 px-3 py-1.5 text-body-xs-regular outline-none"
+                />
+                <Button variant="primary" onClick={handleEnterpriseInstall} loading={isInstalling}>
+                  {isInstalling ? "Redirecting..." : "Connect Enterprise"}
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : null}
+      {installed ? <GithubRepoBindingsRoot workspaceSlug={String(workspaceSlug)} installed={installed} /> : null}
     </div>
   );
 });

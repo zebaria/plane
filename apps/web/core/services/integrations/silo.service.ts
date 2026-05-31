@@ -46,8 +46,11 @@ export class SiloIntegrationService extends APIService {
     return j.url;
   }
 
-  async getGithubInstallUrl(workspaceSlug: string, userId: string): Promise<string> {
-    const url = `${SILO_URL}/api/github/team/auth/url?workspaceSlug=${encodeURIComponent(workspaceSlug)}&userId=${encodeURIComponent(userId)}`;
+  async getGithubInstallUrl(workspaceSlug: string, userId: string, ghesBaseUrl?: string): Promise<string> {
+    // ghesBaseUrl: a GitHub Enterprise Server origin (e.g.
+    // "https://ghe.acme.com"). Empty/absent → cloud github.com.
+    let url = `${SILO_URL}/api/github/team/auth/url?workspaceSlug=${encodeURIComponent(workspaceSlug)}&userId=${encodeURIComponent(userId)}`;
+    if (ghesBaseUrl) url += `&ghesBaseUrl=${encodeURIComponent(ghesBaseUrl)}`;
     const r = await fetch(url, { credentials: "omit" });
     if (!r.ok) throw new Error(`silo github auth/url ${r.status}`);
     const j = (await r.json()) as { url: string };
@@ -78,6 +81,14 @@ export class SiloIntegrationService extends APIService {
 
   async deleteUserConnection(workspaceSlug: string, connectionId: string): Promise<void> {
     await this.delete(`/api/v1/workspaces/${workspaceSlug}/workspace-user-connections/${connectionId}/`);
+  }
+
+  async listGithubRepos(workspaceSlug: string, installationId: string): Promise<GithubRepo[]> {
+    const url = `${SILO_URL}/api/github/repos?workspaceSlug=${encodeURIComponent(workspaceSlug)}&installationId=${encodeURIComponent(installationId)}`;
+    const r = await fetch(url, { credentials: "omit" });
+    if (!r.ok) throw new Error(`silo github repos ${r.status}`);
+    const j = (await r.json()) as { repos: GithubRepo[] };
+    return j.repos ?? [];
   }
 
   async listSlackChannels(workspaceSlug: string, teamId: string): Promise<SlackChannel[]> {
@@ -122,7 +133,27 @@ export class SiloIntegrationService extends APIService {
   async deleteEntityConnection(workspaceSlug: string, id: string): Promise<void> {
     await this.delete(`/api/v1/workspaces/${workspaceSlug}/workspace-entity-connections/${id}/`);
   }
+
+  async updateEntityConnection(
+    workspaceSlug: string,
+    id: string,
+    body: Partial<{
+      entity_data: Record<string, unknown>;
+      config: Record<string, unknown>;
+    }>
+  ): Promise<WorkspaceEntityConnection> {
+    const r = await this.patch(`/api/v1/workspaces/${workspaceSlug}/workspace-entity-connections/${id}/`, body);
+    return r?.data;
+  }
 }
+
+export type GithubRepo = {
+  id: string;
+  full_name: string;
+  name: string;
+  private: boolean;
+  default_branch: string;
+};
 
 export type SlackChannel = {
   id: string;
