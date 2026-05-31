@@ -28,16 +28,41 @@ Permission policy:
   list calls. silo stores them on POST and uses them server-side.
 """
 
+import html as _html
+import json as _json
 from datetime import timedelta
 
+from crum import get_current_user, set_current_user
+from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils import timezone as _tz
 from rest_framework import status
 from rest_framework.response import Response
 
+from plane.api.serializers import IssueCommentSerializer, IssueSerializer
 from plane.app.views.base import BaseAPIView
 from plane.app.permissions import ROLE, allow_permission
-from plane.db.models import Workspace, WorkspaceMember
+from plane.bgtasks.issue_activities_task import issue_activity
+from plane.db.models import (
+    Intake,
+    IntakeIssue,
+    Issue,
+    IssueAssignee,
+    IssueComment,
+    IssueLabel,
+    Label,
+    Project,
+    ProjectMember,
+    State,
+    StateGroup,
+    User,
+    Workspace,
+    WorkspaceMember,
+)
+from plane.db.models.intake import SourceType
+from plane.db.models.issue_type import ProjectIssueType
 
 from .auth import IsSiloAuthenticated, SiloHMACAuthentication
 
@@ -91,7 +116,6 @@ class SiloSlackInstallEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -142,7 +166,6 @@ class SiloSlackInstallEndpoint(BaseAPIView):
         # Set crum + request.user to `installer` so BaseModel.save and any
         # save signals see the resolved actor instead of the anonymous silo
         # principal — otherwise created_by/updated_by audit columns land None.
-        from crum import set_current_user, get_current_user
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(installer)
@@ -224,7 +247,6 @@ class SiloGithubInstallEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -276,8 +298,6 @@ class SiloGithubInstallEndpoint(BaseAPIView):
             "deleted_at": None,
         }
 
-        from crum import set_current_user, get_current_user
-        from django.db import transaction
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(installer)
@@ -374,7 +394,6 @@ class SiloGithubUserConnectEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -431,8 +450,6 @@ class SiloGithubUserConnectEndpoint(BaseAPIView):
             "deleted_at": None,
         }
 
-        from crum import set_current_user, get_current_user
-        from django.db import transaction
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(user)
@@ -728,7 +745,6 @@ class SiloGithubIssueLinkEndpoint(BaseAPIView):
         # connection's workspace before linking. Defense-in-depth: the
         # HMAC channel is trusted, but this stops a silo-side mixup from
         # linking a GH issue to another workspace's work item.
-        from plane.db.models import Issue, Project
 
         if not Project.objects.filter(
             pk=project_id, workspace=wc.workspace
@@ -849,7 +865,6 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import Issue, IssueAssignee, IssueLabel, Project, User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -891,27 +906,87 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Use queryset .update() to bypass BaseModel.save's crum-driven
-        # actor sniffing. Any signal-driven side-effects we want must
-        # be fired explicitly via issue_activity below.
+        # Apply scalar field updates via instance.save() (NOT queryset
+        # .update()) so BaseModel.save's hooks run — notably
+        # _sync_completed_at, which stamps/clears completed_at when the
+        # state group changes. A bare .update() skips that and leaves
+        # completed_at wrong on a GH-driven close/reopen.
+        #
+        # BaseModel.save reads the actor via crum's get_current_user;
+        # the silo HMAC principal is anonymous, so set the thread-local
+        # to `actor` and reset in `finally` to avoid leaking crum state
+        # into another request on the same worker.
+        # Snapshot the pre-update values so the activity tracker can diff
+        # them (track_state dereferences current_instance — passing None
+        # makes it crash, which the try/except below would silently
+        # swallow, losing the state-change activity row). Capturing name
+        # + description_html too lets the activity log record the real
+        # old_value instead of None on title/body edits.
+        prev_state_id = str(issue.state_id) if issue.state_id else None
+        prev_name = issue.name
+        prev_description_html = issue.description_html
+        # Pre-update assignee/label ids: fed to the activity tracker as
+        # old_value AND reused as the "existing" set for the M2M diff
+        # below (so we don't re-query). track_assignees / track_labels
+        # read these from current_instance.
+        prev_assignee_ids = [
+            str(x) for x in IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
+        ]
+        prev_label_ids = [
+            str(x) for x in IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True)
+        ]
+
         updates = {}
         if "name" in data and data["name"] is not None:
             updates["name"] = str(data["name"])[:255]
         if "description_html" in data and data["description_html"] is not None:
             updates["description_html"] = str(data["description_html"])
-        if "state_id" in data and data["state_id"]:
+        # Only treat state as changed when it actually differs. issue.save
+        # → _sync_completed_at keys off has_changed("state_id"), which can
+        # read True from a string-vs-UUID mismatch even when the value is
+        # the same — that would clobber a historical completed_at with
+        # now() on a title-only edit. Compare as strings to avoid it.
+        if "state_id" in data and data["state_id"] and str(data["state_id"]) != (prev_state_id or ""):
+            # Validate the target state exists AND belongs to this project
+            # before applying — an unvalidated state_id could 500 on a
+            # malformed UUID or cross project boundaries with a foreign
+            # state. The ValidationError guard covers the malformed case
+            # (.filter(pk=<bad-uuid>) raises rather than returning empty).
+            try:
+                state_ok = State.objects.filter(pk=data["state_id"], project=project).exists()
+            except (ValidationError, ValueError):
+                state_ok = False
+            if not state_ok:
+                return Response(
+                    {"detail": "state_id is not valid for this project"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             updates["state_id"] = data["state_id"]
 
         if updates:
-            Issue.objects.filter(pk=issue.pk).update(**updates)
+            for field, value in updates.items():
+                setattr(issue, field, value)
+            prev_user = get_current_user()
+            prev_request_user = request.user
+            set_current_user(actor)
+            request.user = actor
+            try:
+                # update_fields keeps the write tight; _sync_completed_at
+                # adds completed_at to the set when state changes. Map the
+                # `state_id` attname to the `state` field name — this
+                # Django version accepts either, but `state` is the
+                # canonical field name and avoids any version-dependent
+                # update_fields validation surprises.
+                update_fields = [("state" if f == "state_id" else f) for f in updates]
+                issue.save(update_fields=update_fields)
+            finally:
+                set_current_user(prev_user)
+                request.user = prev_request_user
 
         # Assignees + labels are M2M; replace the full set if provided.
         if "assignee_ids" in data and isinstance(data["assignee_ids"], list):
             new_ids = {str(x) for x in data["assignee_ids"]}
-            existing = set(
-                IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
-            )
-            existing = {str(x) for x in existing}
+            existing = set(prev_assignee_ids)
             to_add = new_ids - existing
             to_remove = existing - new_ids
             for uid in to_add:
@@ -928,10 +1003,7 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
 
         if "label_ids" in data and isinstance(data["label_ids"], list):
             new_ids = {str(x) for x in data["label_ids"]}
-            existing = set(
-                IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True)
-            )
-            existing = {str(x) for x in existing}
+            existing = set(prev_label_ids)
             to_add = new_ids - existing
             to_remove = existing - new_ids
             for lid in to_add:
@@ -946,21 +1018,35 @@ class SiloUpdateWorkItemEndpoint(BaseAPIView):
             if to_remove:
                 IssueLabel.objects.filter(issue=issue, label_id__in=to_remove).delete()
 
-        # Mirror the activity hook so notification fan-out runs.
-        from plane.bgtasks.issue_activities_task import issue_activity
-        import json as _json
-        from django.utils import timezone as _tz
+        # Mirror the activity hook so notification fan-out runs. Both the
+        # requested (new) and current_instance (old) payloads must carry
+        # every changed field — track_assignees / track_labels read
+        # assignee_ids / label_ids from BOTH, so omitting them on either
+        # side drops the activity row (labels) or logs an empty old_value
+        # (assignees).
         try:
             requested = {k: v for k, v in updates.items()}
-            if "assignee_ids" in data:
-                requested["assignee_ids"] = [str(x) for x in (data["assignee_ids"] or [])]
+            current_inst = {
+                "state_id": prev_state_id,
+                "name": prev_name,
+                "description_html": prev_description_html,
+            }
+            if "assignee_ids" in data and isinstance(data["assignee_ids"], list):
+                requested["assignee_ids"] = [str(x) for x in data["assignee_ids"]]
+                current_inst["assignee_ids"] = prev_assignee_ids
+            if "label_ids" in data and isinstance(data["label_ids"], list):
+                requested["label_ids"] = [str(x) for x in data["label_ids"]]
+                current_inst["label_ids"] = prev_label_ids
             issue_activity.delay(
                 type="issue.activity.updated",
                 requested_data=_json.dumps(requested),
                 actor_id=str(actor.id),
                 issue_id=str(issue.id),
                 project_id=str(project.id),
-                current_instance=None,
+                # Pre-update snapshot so the trackers diff against the
+                # real old values instead of dereferencing None / logging
+                # None as old_value.
+                current_instance=_json.dumps(current_inst),
                 epoch=int(_tz.now().timestamp()),
                 notification=True,
             )
@@ -982,14 +1068,12 @@ class SiloUpdateCommentEndpoint(BaseAPIView):
     `workspace_slug` + `issue_id` scope the lookup: the comment must
     belong to that work item in that workspace. Defense-in-depth — the
     HMAC channel is already trusted, but this stops a silo-side bug
-    from editing/deleting an arbitrary comment by guessed pk.
     """
 
     authentication_classes = [SiloHMACAuthentication]
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import IssueComment
 
         data = request.data or {}
         comment_id = data.get("comment_id")
@@ -1048,7 +1132,6 @@ class SiloGithubInstallLifecycleEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from django.utils import timezone as _tz
 
         data = request.data or {}
         action = data.get("action")
@@ -1168,7 +1251,6 @@ class SiloSlackTeamContextEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import Project
 
         team_id = (request.data or {}).get("team_id")
         if not team_id:
@@ -1297,7 +1379,6 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -1365,7 +1446,6 @@ class SiloSlackUserConnectEndpoint(BaseAPIView):
 
         # Set crum + request.user to `user` so audit columns and signals
         # see the actual Plane user instead of the anonymous silo principal.
-        from crum import set_current_user, get_current_user
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(user)
@@ -1412,8 +1492,6 @@ class SiloCreateCommentEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.api.serializers import IssueCommentSerializer
-        from plane.db.models import Issue, IssueComment, Project, User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -1495,7 +1573,6 @@ class SiloCreateCommentEndpoint(BaseAPIView):
         # thread-local user we'd land created_by=None and any on_save
         # signals would run with the wrong actor. Reset in `finally` so
         # we never leak crum state into another request on the same worker.
-        from crum import set_current_user, get_current_user
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(actor)
@@ -1512,9 +1589,6 @@ class SiloCreateCommentEndpoint(BaseAPIView):
             request.user = prev_request_user
 
         # Fire activity so silo notification fan-out runs.
-        from plane.bgtasks.issue_activities_task import issue_activity
-        import json as _json
-        from django.utils import timezone as _tz
 
         try:
             issue_activity.delay(
@@ -1612,7 +1686,6 @@ class SiloWorkItemLookupEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import Project, Issue, State
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -1692,14 +1765,6 @@ class SiloProjectMetadataEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import (
-            Issue,
-            Label,
-            Project,
-            ProjectMember,
-            State,
-        )
-        from plane.db.models.issue_type import ProjectIssueType
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -1805,8 +1870,6 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.api.serializers import IssueSerializer
-        from plane.db.models import Project, Issue, User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -1900,7 +1963,6 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
 
         # Escape so user-typed `<`, `>`, `&` don't get stripped or
         # mis-parsed by the editor's HTML sanitizer.
-        import html as _html
         if description_html:
             html_value = description_html
         elif description:
@@ -1925,8 +1987,6 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         # the api IssueSerializer's state validator excludes triage
         # states, so we don't pass it through the serializer — we
         # update issue.state after save.
-        from plane.db.models import State, StateGroup, Intake, IntakeIssue
-        from plane.db.models.intake import SourceType
         triage_state = None
         if as_intake:
             triage_state = State.triage_objects.filter(project_id=project.id, workspace=ws).first()
@@ -1961,7 +2021,6 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         # any on_save signals run with the wrong actor. Set the thread-
         # local for the duration of the save and restore it after, so we
         # don't leak crum state into another request on the same worker.
-        from crum import set_current_user, get_current_user
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(actor)
@@ -1998,9 +2057,6 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         # Fire the same activity hook as the public IssueListCreate
         # endpoint so downstream listeners (the silo Slack-notification
         # fan-out, in particular) see the create event.
-        from plane.bgtasks.issue_activities_task import issue_activity
-        import json as _json
-        from django.utils import timezone as _tz
 
         try:
             issue_activity.delay(
@@ -2046,7 +2102,6 @@ class SiloAddAssigneeEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import Issue, IssueAssignee, Project, ProjectMember, User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -2126,9 +2181,6 @@ class SiloAddAssigneeEndpoint(BaseAPIView):
         # Mirror IssueViewSet.partial_update's activity payload shape:
         # current_instance carries the old assignee_ids; requested_data
         # carries the new full set.
-        from plane.bgtasks.issue_activities_task import issue_activity
-        import json as _json
-        from django.utils import timezone as _tz
 
         try:
             issue_activity.delay(
@@ -2164,7 +2216,6 @@ class SiloChangeStateEndpoint(BaseAPIView):
     permission_classes = [IsSiloAuthenticated]
 
     def post(self, request):
-        from plane.db.models import Issue, Project, State, User
 
         data = request.data or {}
         slug = data.get("workspace_slug")
@@ -2228,7 +2279,6 @@ class SiloChangeStateEndpoint(BaseAPIView):
         # the save so updated_by gets the resolved actor instead of
         # silo's anonymous HMAC principal; restore in finally so we
         # never leak crum state across requests on the same worker.
-        from crum import set_current_user, get_current_user
         prev_user = get_current_user()
         prev_request_user = request.user
         set_current_user(actor)
@@ -2240,9 +2290,6 @@ class SiloChangeStateEndpoint(BaseAPIView):
             set_current_user(prev_user)
             request.user = prev_request_user
 
-        from plane.bgtasks.issue_activities_task import issue_activity
-        import json as _json
-        from django.utils import timezone as _tz
 
         try:
             issue_activity.delay(
