@@ -86,23 +86,36 @@ export const decodeManifestState = (raw: string): { env: string; ghesBaseUrl?: s
   return { env, ghesBaseUrl: encHost ? decodeURIComponent(encHost) : undefined };
 };
 
+// Escape values reflected into the bootstrap HTML. `org` is free-form
+// query input and `ghesHost`, though allowlist-validated, is still
+// user-influenced — neither must be able to inject markup (CodeQL
+// js/reflected-xss). `env` is already constrained to a fixed set but
+// we escape it too for uniformity.
+const htmlEscape = (s: string): string =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
 const renderManifestForm = (env: string, org: string, ghesHost?: string): string => {
   const manifest = loadManifest(env);
   const target = manifestUrlFor(org, ghesHost);
   const stateValue = encodeManifestState(env, ghesHost);
-  const where = ghesHost ? ` (GHES at ${ghesHost})` : "";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Plane GitHub App bootstrap (${env}${where})</title></head>
+  const envH = htmlEscape(env);
+  const orgH = htmlEscape(org);
+  const whereH = ghesHost ? ` (GHES at ${htmlEscape(ghesHost)})` : "";
+  // `target` is built from webBaseFor() (cloud constant or the
+  // allowlist-validated GHES origin) + an encodeURIComponent'd org, so
+  // it's already a safe URL; stateValue is URL-encoded for the query.
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Plane GitHub App bootstrap (${envH}${whereH})</title></head>
 <body>
-<h1>Create GitHub App for env=${env}${where}</h1>
+<h1>Create GitHub App for env=${envH}${whereH}</h1>
 <p>Click the button to register a new GitHub App against the
-<code>${org}</code> org. After GitHub creates it you'll be redirected
+<code>${orgH}</code> org. After GitHub creates it you'll be redirected
 back to silo, which will store the App credentials in AWS Secrets
-Manager at <code>/${env}/plane-github</code>. Then click
+Manager at <code>/${envH}/plane-github</code>. Then click
 <strong>Install App</strong> on the new App's page to install it
 into the org and pick repos.</p>
-<form method="post" action="${target}?state=${encodeURIComponent(stateValue)}">
+<form method="post" action="${htmlEscape(target)}?state=${encodeURIComponent(stateValue)}">
   <input type="hidden" name="manifest" value='${JSON.stringify(manifest).replace(/'/g, "&#39;")}'>
-  <button type="submit">Create GitHub App for ${env}${where}</button>
+  <button type="submit">Create GitHub App for ${envH}${whereH}</button>
 </form>
 </body></html>`;
 };
@@ -201,10 +214,16 @@ export const githubOAuthRouter = (): Router => {
           oauthClientSecret: oauth?.client_secret ?? "",
         });
       }
+      // `conv.html_url` comes from the manifest-conversion response of a
+      // user-influenced host (GHES), so escape it before reflecting it
+      // into HTML (CodeQL js/reflected-xss). `env` is fixed-set but
+      // escaped for uniformity.
+      const envH = htmlEscape(env);
+      const htmlUrlH = htmlEscape(conv.html_url ?? "");
       res.type("html").send(
-        `<!doctype html><html><body><h1>App created for env=${env}</h1>
-<p>Stored in AWS Secrets Manager at <code>/${env}/plane-github</code>.</p>
-<p>Next step: visit <a href="${conv.html_url}">${conv.html_url}</a>
+        `<!doctype html><html><body><h1>App created for env=${envH}</h1>
+<p>Stored in AWS Secrets Manager at <code>/${envH}/plane-github</code>.</p>
+<p>Next step: visit <a href="${htmlUrlH}">${htmlUrlH}</a>
 and click <strong>Install App</strong> to install it into the
 zebaria org and choose repos.</p>
 </body></html>`

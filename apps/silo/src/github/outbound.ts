@@ -41,6 +41,21 @@ export const htmlToMarkdown = (html: string | null | undefined): string => {
   }
 };
 
+// Strip HTML tags repeatedly until the string is stable. A single
+// pass of /<[^>]+>/g can leave fragments behind when tags are nested
+// or malformed (the classic incomplete-sanitization footgun); looping
+// to a fixed point closes that. Bounded — each pass strictly shrinks
+// the string or stops.
+const stripTags = (s: string): string => {
+  let prev: string;
+  let cur = s;
+  do {
+    prev = cur;
+    cur = cur.replace(/<[^>]*>/g, "");
+  } while (cur !== prev);
+  return cur;
+};
+
 // Rewrite Plane's `<mention-component entity_name="user_mention"
 // entity_identifier="<plane_user_id>">@Display Name</mention-component>`
 // into `@<gh_login>` (or, when the user hasn't linked a GitHub
@@ -66,11 +81,13 @@ export const rewriteMentionsForGithub = (
       // Fall back to the inner text (Plane writes "@Display Name")
       // with whitespace collapsed so GH doesn't try to ping a name
       // with a space in it. Strip a leading "@" since we re-add it.
-      const txt = inner
-        .replace(/<[^>]+>/g, "")
-        .trim()
-        .replace(/^@/, "");
-      const safe = txt.replace(/\s+/g, "");
+      //
+      // The output then has all non-word chars removed, so even an
+      // incompletely-stripped tag fragment (e.g. a stray "<script")
+      // can't survive into the GH mention — `\W` drops `<`, `/`, etc.
+      // (CodeQL js/incomplete-multi-character-sanitization).
+      const txt = stripTags(inner).trim().replace(/^@/, "");
+      const safe = txt.replace(/[^\w.-]/g, "");
       return safe ? `@${safe}` : inner;
     }
   );
