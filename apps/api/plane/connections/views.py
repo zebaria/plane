@@ -234,6 +234,10 @@ class SiloGithubInstallEndpoint(BaseAPIView):
         account_id = data.get("account_id")
         account_type = data.get("account_type") or ""
         repository_selection = data.get("repository_selection") or "selected"
+        # Phase 4g: GHES origin (e.g. "https://ghe.acme.com"). Stored
+        # on connection_data so the bindings endpoint can surface it
+        # to silo without an extra round-trip.
+        ghes_base_url = data.get("ghes_base_url") or None
         if not (slug and installation_id and installer_user_id):
             return Response(
                 {
@@ -311,6 +315,7 @@ class SiloGithubInstallEndpoint(BaseAPIView):
                         "account_id": account_id,
                         "account_type": account_type,
                         "repository_selection": repository_selection,
+                        "ghes_base_url": ghes_base_url,
                     },
                     "scopes": [],
                     "config": {},
@@ -463,6 +468,689 @@ class SiloGithubUserConnectEndpoint(BaseAPIView):
             {"id": str(conn.id), "created": created},
             status=status.HTTP_200_OK,
         )
+
+
+class SiloGithubInstallBelongsEndpoint(BaseAPIView):
+    """Confirm a (workspace_slug, installation_id) pair is a real
+    workspace install. Used by silo before serving repo lists, so a
+    client that knows a workspace slug can't probe arbitrary
+    installation_ids and read someone else's repos.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        installation_id = data.get("installation_id")
+        if not (slug and installation_id):
+            return Response(
+                {"detail": "workspace_slug and installation_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ws = Workspace.objects.filter(slug=slug, deleted_at__isnull=True).first()
+        if not ws:
+            return Response({"ok": False})
+        exists = WorkspaceConnection.objects.filter(
+            workspace=ws,
+            connection_type="github",
+            connection_id=str(installation_id),
+            deleted_at__isnull=True,
+        ).exists()
+        return Response({"ok": exists})
+
+
+class SiloGithubRepoBindingsEndpoint(BaseAPIView):
+    """Look up project↔repo bindings for an inbound GitHub webhook.
+
+    A raw webhook payload tells us `installation.id` + `repository.id`
+    (or `repository.full_name`) but no workspace slug. This endpoint
+    answers: "given this install + this repo, which Plane workspace +
+    project bindings should mirror events into?"
+
+    Returns one row per `WorkspaceEntityConnection(type='github-repo')`
+    matching the install and repo (a single repo can be bound to
+    multiple projects, even across workspaces if two workspaces
+    happen to install on the same org).
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        data = request.data or {}
+        installation_id = data.get("installation_id")
+        repo_id = data.get("repo_id")
+        repo_full_name = data.get("repo_full_name")
+        workspace_slug = data.get("workspace_slug")
+        project_id = data.get("project_id")
+
+        # Two lookup modes:
+        #   inbound webhook  → (installation_id, repo_id|repo_full_name)
+        #   outbound mirror  → (workspace_slug, project_id)
+        # Outbound starts from a Plane work item event and needs to
+        # find which github-repo bindings on that project should
+        # receive mirrored writes.
+        if not (installation_id or (workspace_slug and project_id)):
+            return Response(
+                {"detail": (
+                    "(installation_id + repo_id|repo_full_name) or "
+                    "(workspace_slug + project_id) required"
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        connections_qs = WorkspaceConnection.objects.filter(
+            connection_type="github",
+            deleted_at__isnull=True,
+            credential__deleted_at__isnull=True,
+        ).select_related("workspace")
+        if installation_id:
+            connections_qs = connections_qs.filter(connection_id=str(installation_id))
+        if workspace_slug:
+            connections_qs = connections_qs.filter(workspace__slug=workspace_slug)
+        connections = connections_qs
+        if not connections.exists():
+            return Response({"bindings": []})
+
+        qs = WorkspaceEntityConnection.objects.filter(
+            workspace_connection__in=connections,
+            type="github-repo",
+            deleted_at__isnull=True,
+            workspace_connection__deleted_at__isnull=True,
+        ).select_related("workspace_connection", "workspace_connection__workspace")
+        if repo_id:
+            qs = qs.filter(entity_id=str(repo_id))
+        elif repo_full_name:
+            qs = qs.filter(entity_slug=repo_full_name)
+        if project_id:
+            qs = qs.filter(project_id=project_id)
+
+        out = []
+        for m in qs:
+            wc = m.workspace_connection
+            # Phase 4g: GHES installs persist the customer's web origin
+            # in connection_data so silo can swap api.github.com on a
+            # per-install basis. Empty/None on cloud installs.
+            ghes_base_url = (wc.connection_data or {}).get("ghes_base_url") or None
+            out.append(
+                {
+                    "id": str(m.id),
+                    "workspace_id": str(wc.workspace_id),
+                    "workspace_slug": wc.workspace.slug,
+                    "workspace_connection_id": str(wc.id),
+                    "installation_id": wc.connection_id,
+                    "ghes_base_url": ghes_base_url,
+                    "project_id": str(m.project_id) if m.project_id else None,
+                    "entity_id": m.entity_id,
+                    "entity_slug": m.entity_slug,
+                    "config": m.config or {},
+                }
+            )
+        return Response({"bindings": out})
+
+
+class SiloGithubPrStateMapEndpoint(BaseAPIView):
+    """Resolve the PR-lifecycle → Plane state_id map for a project.
+
+    Phase 4f. The 6-key map (`draft`, `opened`, `review_requested`,
+    `approved`, `merged`, `closed_without_merge`) is stored as a
+    `WorkspaceEntityConnection(type='github-pr-state-map', ...)` row.
+    Two scopes:
+      - workspace default: `project_id IS NULL`
+      - per-project override: `project_id=<pid>`
+
+    Resolution rule: per-project overrides win key-by-key over the
+    workspace default. Missing keys are simply absent from the
+    response — silo treats absent keys as "leave Plane state alone"
+    for that PR transition.
+
+    Lookup mode: silo passes either (installation_id, repo_id) or
+    (workspace_slug, project_id). The first comes from a raw
+    pull_request webhook payload and resolves the project via the
+    matching `github-repo` binding. We accept both because the
+    pull_request handler doesn't always know the workspace slug
+    until after the binding lookup.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        data = request.data or {}
+        workspace_slug = data.get("workspace_slug")
+        project_id = data.get("project_id")
+        installation_id = data.get("installation_id")
+        repo_id = data.get("repo_id")
+        repo_full_name = data.get("repo_full_name")
+
+        if not (
+            (workspace_slug and project_id)
+            or (installation_id and (repo_id or repo_full_name))
+        ):
+            return Response(
+                {"detail": (
+                    "(workspace_slug + project_id) or "
+                    "(installation_id + repo_id|repo_full_name) required"
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # If only the install+repo were given, find the project via the
+        # github-repo binding (same row pull_request lookups already use).
+        if not (workspace_slug and project_id):
+            qs = WorkspaceEntityConnection.objects.filter(
+                workspace_connection__connection_type="github",
+                workspace_connection__connection_id=str(installation_id),
+                workspace_connection__deleted_at__isnull=True,
+                type="github-repo",
+                deleted_at__isnull=True,
+            ).select_related("workspace_connection__workspace")
+            if repo_id:
+                qs = qs.filter(entity_id=str(repo_id))
+            else:
+                qs = qs.filter(entity_slug=repo_full_name)
+            binding = qs.first()
+            if not binding or not binding.project_id:
+                return Response({"map": {}, "scope": None})
+            workspace = binding.workspace_connection.workspace
+            project_id = str(binding.project_id)
+        else:
+            workspace = get_object_or_404(Workspace, slug=workspace_slug)
+
+        rows = list(
+            WorkspaceEntityConnection.objects.filter(
+                workspace=workspace,
+                type="github-pr-state-map",
+                deleted_at__isnull=True,
+            ).values("project_id", "config")
+        )
+        # Workspace default first, per-project override layered on top.
+        merged: dict = {}
+        for r in rows:
+            if r["project_id"] is None:
+                merged.update((r.get("config") or {}).get("prStateMap") or {})
+        for r in rows:
+            if str(r["project_id"]) == str(project_id):
+                merged.update((r.get("config") or {}).get("prStateMap") or {})
+        # Drop empty-string values — the FE writes "" when the user clears
+        # a row, and silo's "absent ⇒ leave state alone" rule needs
+        # absence, not the empty string.
+        out = {k: v for k, v in merged.items() if v}
+        scope = "project" if any(
+            str(r["project_id"]) == str(project_id) for r in rows
+        ) else ("workspace" if any(r["project_id"] is None for r in rows) else None)
+        return Response({"map": out, "scope": scope, "project_id": str(project_id)})
+
+
+class SiloGithubIssueLinkEndpoint(BaseAPIView):
+    """Persist (or look up) the link between a GitHub Issue and a
+    Plane work item. Stored as a
+    `WorkspaceEntityConnection(type='github-issue-link')` row scoped
+    to the same workspace_connection as the repo binding.
+
+    POST creates-or-returns the link. GET-style lookups (by gh issue
+    id) hit `/silo/github/issue-link/lookup/` instead so this endpoint
+    stays write-only.
+
+    Body:
+      workspace_connection_id, project_id, gh_issue_id (str),
+      gh_issue_number (int, for backlink rendering),
+      gh_repo_full_name, plane_issue_id, plane_project_id.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        data = request.data or {}
+        wc_id = data.get("workspace_connection_id")
+        project_id = data.get("project_id")
+        gh_issue_id = data.get("gh_issue_id")
+        gh_issue_number = data.get("gh_issue_number")
+        gh_repo_full_name = data.get("gh_repo_full_name") or ""
+        plane_issue_id = data.get("plane_issue_id")
+        plane_project_id = data.get("plane_project_id")
+        gh_comment_map = data.get("gh_comment_map")
+        plane_comment_map = data.get("plane_comment_map")
+        if not (wc_id and project_id and gh_issue_id and plane_issue_id and plane_project_id):
+            return Response(
+                {"detail": (
+                    "workspace_connection_id, project_id, gh_issue_id, "
+                    "plane_issue_id, plane_project_id required"
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        wc = get_object_or_404(WorkspaceConnection, pk=wc_id, deleted_at__isnull=True)
+        # Verify the Plane project + work item actually live in this
+        # connection's workspace before linking. Defense-in-depth: the
+        # HMAC channel is trusted, but this stops a silo-side mixup from
+        # linking a GH issue to another workspace's work item.
+        from plane.db.models import Issue, Project
+
+        if not Project.objects.filter(
+            pk=project_id, workspace=wc.workspace
+        ).exists():
+            return Response(
+                {"detail": "project_id does not belong to this connection's workspace"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not Issue.objects.filter(
+            pk=plane_issue_id, workspace=wc.workspace, project_id=project_id
+        ).exists():
+            return Response(
+                {"detail": "plane_issue_id does not belong to project_id in this workspace"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Preserve any existing `entity_data` keys (notably
+        # `gh_comment_map`) by merging instead of replacing. The
+        # comment map grows over the issue's lifetime as comments
+        # are mirrored — caller passes the merged map when it has
+        # one, otherwise we leave whatever was already there.
+        existing = WorkspaceEntityConnection.objects.filter(
+            workspace_connection=wc,
+            type="github-issue-link",
+            entity_type="issue",
+            entity_id=str(gh_issue_id),
+        ).first()
+        merged_entity_data = dict((existing.entity_data or {}) if existing else {})
+        merged_entity_data["gh_issue_number"] = gh_issue_number
+        merged_entity_data["gh_repo_full_name"] = gh_repo_full_name
+        if gh_comment_map is not None and isinstance(gh_comment_map, dict):
+            merged_entity_data["gh_comment_map"] = gh_comment_map
+        if plane_comment_map is not None and isinstance(plane_comment_map, dict):
+            merged_entity_data["plane_comment_map"] = plane_comment_map
+
+        link, _created = WorkspaceEntityConnection.objects.update_or_create(
+            workspace=wc.workspace,
+            workspace_connection=wc,
+            type="github-issue-link",
+            entity_type="issue",
+            entity_id=str(gh_issue_id),
+            defaults={
+                "project_id": project_id,
+                "issue_id": plane_issue_id,
+                "entity_slug": gh_repo_full_name,
+                "entity_data": merged_entity_data,
+                "config": {"plane_project_id": plane_project_id},
+            },
+        )
+        return Response(
+            {
+                "id": str(link.id),
+                "plane_issue_id": str(link.issue_id) if link.issue_id else None,
+                "plane_project_id": str(link.project_id) if link.project_id else None,
+            }
+        )
+
+
+class SiloGithubIssueLinkLookupEndpoint(BaseAPIView):
+    """Find an existing `github-issue-link` row by gh_issue_id (and
+    optionally workspace_connection_id) so silo can short-circuit
+    duplicate-create on retried webhook deliveries and look up the
+    Plane work item to PATCH on edit/close events.
+
+    Returns 404 if no link exists.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        data = request.data or {}
+        gh_issue_id = data.get("gh_issue_id")
+        plane_issue_id = data.get("plane_issue_id")
+        wc_id = data.get("workspace_connection_id")
+        if not (gh_issue_id or plane_issue_id):
+            return Response(
+                {"detail": "gh_issue_id or plane_issue_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        qs = WorkspaceEntityConnection.objects.filter(
+            type="github-issue-link",
+            entity_type="issue",
+            deleted_at__isnull=True,
+        )
+        if gh_issue_id:
+            qs = qs.filter(entity_id=str(gh_issue_id))
+        if plane_issue_id:
+            qs = qs.filter(issue_id=plane_issue_id)
+        if wc_id:
+            qs = qs.filter(workspace_connection_id=wc_id)
+        link = qs.first()
+        if not link:
+            return Response({"detail": "not found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {
+                "id": str(link.id),
+                "workspace_connection_id": str(link.workspace_connection_id),
+                "project_id": str(link.project_id) if link.project_id else None,
+                "plane_issue_id": str(link.issue_id) if link.issue_id else None,
+                "entity_id": link.entity_id,
+                "entity_slug": link.entity_slug,
+                "entity_data": link.entity_data or {},
+            }
+        )
+
+
+class SiloUpdateWorkItemEndpoint(BaseAPIView):
+    """PATCH a Plane work item from a mirrored source (GitHub Issue
+    edit / close / reopen / assignee change). Resolves actor from
+    `gh_user_login` via `WorkspaceUserConnection(connection_slug=...)`
+    when set; falls back to the workspace install's installer.
+
+    Accepts a partial payload — any of: name, description, state_id,
+    assignee_ids, label_ids. Unspecified fields untouched.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import Issue, IssueAssignee, IssueLabel, Project, User
+
+        data = request.data or {}
+        slug = data.get("workspace_slug")
+        project_id = data.get("project_id")
+        issue_id = data.get("issue_id")
+        gh_user_login = data.get("gh_user_login")
+        actor_id = data.get("actor_user_id")
+        if not (slug and project_id and issue_id):
+            return Response(
+                {"detail": "workspace_slug, project_id, issue_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ws = get_object_or_404(Workspace, slug=slug)
+        project = get_object_or_404(Project, pk=project_id, workspace=ws)
+        issue = get_object_or_404(Issue, pk=issue_id, project=project)
+
+        actor = None
+        if actor_id:
+            actor = User.objects.filter(pk=actor_id).first()
+        if not actor and gh_user_login:
+            uc = (
+                WorkspaceUserConnection.objects.filter(
+                    workspace=ws,
+                    connection_type="github",
+                    connection_slug=gh_user_login,
+                )
+                .select_related("user")
+                .first()
+            )
+            if uc:
+                actor = uc.user
+        if not actor:
+            cred = WorkspaceCredential.objects.filter(workspace=ws, source="github").first()
+            if cred:
+                actor = cred.user
+        if not actor:
+            return Response(
+                {"detail": "could not resolve actor"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Use queryset .update() to bypass BaseModel.save's crum-driven
+        # actor sniffing. Any signal-driven side-effects we want must
+        # be fired explicitly via issue_activity below.
+        updates = {}
+        if "name" in data and data["name"] is not None:
+            updates["name"] = str(data["name"])[:255]
+        if "description_html" in data and data["description_html"] is not None:
+            updates["description_html"] = str(data["description_html"])
+        if "state_id" in data and data["state_id"]:
+            updates["state_id"] = data["state_id"]
+
+        if updates:
+            Issue.objects.filter(pk=issue.pk).update(**updates)
+
+        # Assignees + labels are M2M; replace the full set if provided.
+        if "assignee_ids" in data and isinstance(data["assignee_ids"], list):
+            new_ids = {str(x) for x in data["assignee_ids"]}
+            existing = set(
+                IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True)
+            )
+            existing = {str(x) for x in existing}
+            to_add = new_ids - existing
+            to_remove = existing - new_ids
+            for uid in to_add:
+                IssueAssignee.objects.create(
+                    assignee_id=uid,
+                    issue=issue,
+                    project_id=project.id,
+                    workspace_id=ws.id,
+                    created_by_id=actor.id,
+                    updated_by_id=actor.id,
+                )
+            if to_remove:
+                IssueAssignee.objects.filter(issue=issue, assignee_id__in=to_remove).delete()
+
+        if "label_ids" in data and isinstance(data["label_ids"], list):
+            new_ids = {str(x) for x in data["label_ids"]}
+            existing = set(
+                IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True)
+            )
+            existing = {str(x) for x in existing}
+            to_add = new_ids - existing
+            to_remove = existing - new_ids
+            for lid in to_add:
+                IssueLabel.objects.create(
+                    label_id=lid,
+                    issue=issue,
+                    project_id=project.id,
+                    workspace_id=ws.id,
+                    created_by_id=actor.id,
+                    updated_by_id=actor.id,
+                )
+            if to_remove:
+                IssueLabel.objects.filter(issue=issue, label_id__in=to_remove).delete()
+
+        # Mirror the activity hook so notification fan-out runs.
+        from plane.bgtasks.issue_activities_task import issue_activity
+        import json as _json
+        from django.utils import timezone as _tz
+        try:
+            requested = {k: v for k, v in updates.items()}
+            if "assignee_ids" in data:
+                requested["assignee_ids"] = [str(x) for x in (data["assignee_ids"] or [])]
+            issue_activity.delay(
+                type="issue.activity.updated",
+                requested_data=_json.dumps(requested),
+                actor_id=str(actor.id),
+                issue_id=str(issue.id),
+                project_id=str(project.id),
+                current_instance=None,
+                epoch=int(_tz.now().timestamp()),
+                notification=True,
+            )
+        except Exception:
+            pass
+
+        return Response({"id": str(issue.id), "updated": True})
+
+
+class SiloUpdateCommentEndpoint(BaseAPIView):
+    """PATCH or DELETE an IssueComment by id. Used to mirror edits /
+    deletions from GitHub issue comments. Idempotent on missing rows
+    (returns 200 with deleted=true) so a webhook retry on a deleted
+    comment doesn't 5xx silo.
+
+    Body: {comment_id, action: "edit"|"delete", comment_html?,
+           workspace_slug, issue_id}
+
+    `workspace_slug` + `issue_id` scope the lookup: the comment must
+    belong to that work item in that workspace. Defense-in-depth — the
+    HMAC channel is already trusted, but this stops a silo-side bug
+    from editing/deleting an arbitrary comment by guessed pk.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from plane.db.models import IssueComment
+
+        data = request.data or {}
+        comment_id = data.get("comment_id")
+        action = data.get("action")
+        workspace_slug = data.get("workspace_slug")
+        issue_id = data.get("issue_id")
+        if not (comment_id and action in {"edit", "delete"}):
+            return Response(
+                {"detail": "comment_id and action in (edit, delete) required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not (workspace_slug and issue_id):
+            return Response(
+                {"detail": "workspace_slug and issue_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Scope the lookup to the claimed workspace + work item so a
+        # bad comment_id can't reach across to another workspace's data.
+        comment = IssueComment.objects.filter(
+            pk=comment_id,
+            issue_id=issue_id,
+            workspace__slug=workspace_slug,
+        ).first()
+        if not comment:
+            return Response({"id": str(comment_id), "missing": True})
+        if action == "delete":
+            comment.delete()
+            return Response({"id": str(comment_id), "deleted": True})
+        comment_html = data.get("comment_html") or ""
+        IssueComment.objects.filter(pk=comment.pk).update(comment_html=comment_html)
+        return Response({"id": str(comment_id), "updated": True})
+
+
+class SiloGithubInstallLifecycleEndpoint(BaseAPIView):
+    """Reflect GitHub install lifecycle events into Plane state.
+
+    Accepts: {action: "uninstalled" | "repos_changed" | "repo_renamed"
+              | "repo_archived" | "repo_deleted",
+              installation_id, ...}.
+
+    - uninstalled: soft-delete every WorkspaceConnection for this
+      install (one per workspace if multiple share the org), plus
+      cascade-soft-delete their `github-repo` and
+      `github-issue-link` entity connections.
+    - repos_changed: merge the added/removed repo deltas into
+      `connection_data.repositories` for all matching workspace
+      connections (the webhook only carries the delta, not the full
+      selection).
+    - repo_renamed: update `entity_slug` on `github-repo` rows
+      (entity_id stays the same).
+    - repo_archived / repo_deleted: soft-delete `github-repo` rows
+      for that repo across all matching connections.
+    """
+
+    authentication_classes = [SiloHMACAuthentication]
+    permission_classes = [IsSiloAuthenticated]
+
+    def post(self, request):
+        from django.utils import timezone as _tz
+
+        data = request.data or {}
+        action = data.get("action")
+        installation_id = data.get("installation_id")
+        if not (action and installation_id):
+            return Response(
+                {"detail": "action and installation_id required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        connections = WorkspaceConnection.objects.filter(
+            connection_type="github",
+            connection_id=str(installation_id),
+            deleted_at__isnull=True,
+        )
+
+        if action == "uninstalled":
+            now = _tz.now()
+            for wc in connections:
+                # Soft-delete via .update() to bypass crum (silo
+                # principal is anonymous) and avoid recursive on_save.
+                WorkspaceEntityConnection.objects.filter(
+                    workspace_connection=wc, deleted_at__isnull=True
+                ).update(deleted_at=now)
+                WorkspaceConnection.objects.filter(pk=wc.pk).update(deleted_at=now)
+            return Response({"deleted": connections.count()})
+
+        if action == "repos_changed":
+            # `installation_repositories` carries only the delta, so we
+            # merge into the cached list instead of replacing it — a
+            # wholesale replace would drop every previously-selected
+            # repo on the first add/remove. Legacy callers that still
+            # send a full `repositories` list keep working.
+            added = data.get("repositories_added") or []
+            removed = data.get("repositories_removed") or []
+            legacy_full = data.get("repositories")
+            removed_ids = {str(r.get("id")) for r in removed}
+            added_ids = {str(r.get("id")) for r in added}
+            for wc in connections:
+                cd = dict(wc.connection_data or {})
+                if legacy_full is not None and not (added or removed):
+                    cd["repositories"] = legacy_full
+                else:
+                    current = list(cd.get("repositories") or [])
+                    # Drop anything removed or about to be re-added
+                    # (dedupe by id), then append the current adds.
+                    kept = [
+                        r
+                        for r in current
+                        if str(r.get("id")) not in removed_ids
+                        and str(r.get("id")) not in added_ids
+                    ]
+                    cd["repositories"] = kept + [
+                        {"id": str(r.get("id")), "full_name": r.get("full_name")}
+                        for r in added
+                    ]
+                WorkspaceConnection.objects.filter(pk=wc.pk).update(connection_data=cd)
+            return Response({"updated": connections.count()})
+
+        if action == "repo_renamed":
+            old = data.get("repo_full_name_old")
+            new = data.get("repo_full_name_new")
+            repo_id = data.get("repo_id")
+            if not (repo_id and new):
+                return Response(
+                    {"detail": "repo_id and repo_full_name_new required"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qs = WorkspaceEntityConnection.objects.filter(
+                workspace_connection__in=connections,
+                type="github-repo",
+                entity_id=str(repo_id),
+                deleted_at__isnull=True,
+            )
+            if old:
+                qs = qs.filter(entity_slug=old)
+            updated = qs.update(entity_slug=new)
+            return Response({"updated": updated})
+
+        if action in {"repo_archived", "repo_deleted"}:
+            repo_id = data.get("repo_id")
+            if not repo_id:
+                return Response(
+                    {"detail": "repo_id required"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            now = _tz.now()
+            # Soft-delete the github-repo bindings for this repo across
+            # all matching connections. github-issue-link rows are left
+            # alone — without them in place, future webhook hits on the
+            # archived repo won't find a binding to mirror through (fail
+            # closed), but historical links to existing Plane work items
+            # stay queryable.
+            n_repo = WorkspaceEntityConnection.objects.filter(
+                workspace_connection__in=connections,
+                type="github-repo",
+                entity_id=str(repo_id),
+                deleted_at__isnull=True,
+            ).update(deleted_at=now)
+            return Response({"deleted": n_repo})
+
+        return Response({"detail": f"unknown action: {action}"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class SiloSlackTeamContextEndpoint(BaseAPIView):
@@ -735,6 +1423,7 @@ class SiloCreateCommentEndpoint(BaseAPIView):
         actor_id = data.get("actor_user_id")
         slack_user_id = data.get("slack_user_id")
         slack_team_id = data.get("slack_team_id")
+        gh_user_login = data.get("gh_user_login")
 
         if not (slug and project_id and issue_id and comment_html):
             return Response(
@@ -766,6 +1455,22 @@ class SiloCreateCommentEndpoint(BaseAPIView):
             cred = WorkspaceCredential.objects.filter(
                 workspace=ws, source="slack", source_identifier=slack_team_id
             ).first()
+            if cred:
+                actor = cred.user
+        if not actor and gh_user_login:
+            uc = (
+                WorkspaceUserConnection.objects.filter(
+                    workspace=ws,
+                    connection_type="github",
+                    connection_slug=gh_user_login,
+                )
+                .select_related("user")
+                .first()
+            )
+            if uc:
+                actor = uc.user
+        if not actor:
+            cred = WorkspaceCredential.objects.filter(workspace=ws, source="github").first()
             if cred:
                 actor = cred.user
         if not actor:
@@ -1108,9 +1813,18 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         project_id = data.get("project_id")
         title = (data.get("title") or "").strip()
         description = data.get("description") or ""
+        # Two callers, two formats:
+        #   - Slack action submits → plain text in `description`,
+        #     needs HTML-escape + <p> wrap so Plane's editor doesn't
+        #     mis-parse user `<`, `>`, `&`.
+        #   - GitHub issues handler → already-rendered HTML (from
+        #     marked) in `description_html`. Pass through; the editor
+        #     parses standard tags (h1-h6, p, ul, li, code, a).
+        description_html = data.get("description_html")
         actor_id = data.get("actor_user_id")
         slack_user_id = data.get("slack_user_id")
         slack_team_id = data.get("slack_team_id")
+        gh_user_login = data.get("gh_user_login")
         type_id = data.get("type_id") or None
         state_id = data.get("state_id") or None
         priority = data.get("priority") or None
@@ -1159,6 +1873,25 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
             ).first()
             if cred:
                 actor = cred.user
+        if not actor and gh_user_login:
+            uc = (
+                WorkspaceUserConnection.objects.filter(
+                    workspace=ws,
+                    connection_type="github",
+                    connection_slug=gh_user_login,
+                )
+                .select_related("user")
+                .first()
+            )
+            if uc:
+                actor = uc.user
+        if not actor:
+            # GitHub mirror path: fall back to the workspace install's
+            # installer when no per-user mapping exists. Lets a webhook
+            # mirror an issue from an unmapped GH user without 400ing.
+            cred = WorkspaceCredential.objects.filter(workspace=ws, source="github").first()
+            if cred:
+                actor = cred.user
         if not actor:
             return Response(
                 {"detail": "could not resolve actor; provide actor_user_id or slack_user_id"},
@@ -1168,9 +1901,15 @@ class SiloCreateWorkItemEndpoint(BaseAPIView):
         # Escape so user-typed `<`, `>`, `&` don't get stripped or
         # mis-parsed by the editor's HTML sanitizer.
         import html as _html
+        if description_html:
+            html_value = description_html
+        elif description:
+            html_value = f"<p>{_html.escape(description)}</p>"
+        else:
+            html_value = "<p></p>"
         payload = {
             "name": title[:255],
-            "description_html": f"<p>{_html.escape(description)}</p>" if description else "<p></p>",
+            "description_html": html_value,
         }
         if type_id:
             payload["type_id"] = type_id

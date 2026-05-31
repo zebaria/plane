@@ -39,6 +39,42 @@ from plane.db.models import Issue, IssueComment, Project, State, User
 log = logging.getLogger("plane.bgtasks.silo_notification")
 
 SLACK_NOTIFICATION_TYPE = "slack-channel-notification"
+GITHUB_REPO_TYPE = "github-repo"
+
+# Per-integration registry. Each entry is one *mapping kind* that can
+# pull a project into the silo notification fan-out. The orchestrator
+# below queries the union; silo decides per-integration what to do
+# with the event. To add another integration (Linear, Jira, …), add
+# a row here and a matching dispatcher on the silo side — the
+# orchestrator stays untouched.
+#
+#   mapping_type: WorkspaceEntityConnection.type to look for
+#   events: which of our event_type strings this integration cares
+#           about. Used today only for the existence-check fast path —
+#           if no mapping subscribes to this event, we can skip
+#           building the heavy payload.
+INTEGRATIONS = (
+    {
+        "mapping_type": SLACK_NOTIFICATION_TYPE,
+        "events": (
+            "work_item.created",
+            "work_item.state_changed",
+            "work_item.commented",
+            "work_item.completed",
+        ),
+    },
+    {
+        "mapping_type": GITHUB_REPO_TYPE,
+        "events": (
+            "work_item.created",
+            "work_item.updated",
+            "work_item.state_changed",
+            "work_item.commented",
+            "work_item.completed",
+        ),
+    },
+)
+INTEGRATION_MAPPING_TYPES = tuple(i["mapping_type"] for i in INTEGRATIONS)
 
 # Map issue_activity event type → our payload event_type. Anything not
 # in this map is ignored (we don't care about cycle/module/link/etc.
@@ -168,6 +204,55 @@ def _render_comment_for_slack(comment: IssueComment | None, workspace_id: str) -
     return render(soup).strip()
 
 
+def _gh_mention_map(htmls: list[str], workspace_id: str) -> dict[str, str]:
+    """Collect plane_user_id → github_login for `<mention-component>`
+    tags found anywhere in the given HTML blobs.
+
+    Used by the outbound GitHub mirror to rewrite Plane's mentions as
+    `@<gh_login>` so GitHub renders them as a real notification ping
+    instead of the Plane display name (which doesn't link to anything
+    on the GH side).
+
+    Only Plane users that have linked their GitHub identity (via the
+    `connect github account` UI) end up in the map; everyone else
+    falls back to display-name rendering on the silo side.
+    """
+    from bs4 import BeautifulSoup
+
+    raw_ids: set[str] = set()
+    for html in htmls:
+        if not html or "mention-component" not in html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all("mention-component", attrs={"entity_name": "user_mention"}):
+            uid = tag.get("entity_identifier")
+            if uid:
+                raw_ids.add(str(uid))
+    if not raw_ids:
+        return {}
+
+    valid_ids: set[str] = set()
+    for uid in raw_ids:
+        try:
+            uuid.UUID(uid)
+            valid_ids.add(uid)
+        except ValueError:
+            continue
+    if not valid_ids:
+        return {}
+
+    out: dict[str, str] = {}
+    for m in WorkspaceUserConnection.objects.filter(
+        workspace_id=workspace_id,
+        connection_type="github",
+        user_id__in=valid_ids,
+        deleted_at__isnull=True,
+    ):
+        if m.connection_slug:
+            out[str(m.user_id)] = m.connection_slug
+    return out
+
+
 @shared_task
 def dispatch_silo_work_item_event(
     activity_type: str,
@@ -219,16 +304,20 @@ def dispatch_silo_work_item_event(
 
         # Existence check: is anything live bound for this project?
         # Walk up to workspace_connection + credential so we don't fan
-        # events out for an integration that's been removed.
+        # events out for an integration that's been removed. Either a
+        # Slack channel mapping or a GitHub repo binding is enough to
+        # justify the dispatch — silo decides per-channel whether to
+        # actually emit.
         mappings_qs = WorkspaceEntityConnection.objects.filter(
             project_id=project_id,
-            type=SLACK_NOTIFICATION_TYPE,
+            type__in=INTEGRATION_MAPPING_TYPES,
             deleted_at__isnull=True,
             workspace_connection__deleted_at__isnull=True,
             workspace_connection__credential__deleted_at__isnull=True,
         )
         if not mappings_qs.exists():
             return
+        live_mapping_types = set(mappings_qs.values_list("type", flat=True))
 
         try:
             project = Project.objects.select_related("workspace").get(pk=project_id)
@@ -403,6 +492,30 @@ def dispatch_silo_work_item_event(
                     }
                 )
 
+        # Labels / assignees on the issue at the time of the event.
+        # Used by the GitHub dispatcher to gate Plane→GH outbound on the
+        # presence of the `GitHub` label, and to mirror assignee changes
+        # back into GH issues.
+        labels: list[dict[str, str]] = []
+        if issue is not None:
+            try:
+                labels = [
+                    {"id": str(lid), "name": str(name)}
+                    for lid, name in issue.labels.values_list("id", "name")
+                ]
+            except Exception:  # pragma: no cover — labels relation absent
+                labels = []
+
+        mention_map: dict[str, str] = {}
+        if GITHUB_REPO_TYPE in live_mapping_types:
+            htmls: list[str] = []
+            if issue is not None and issue.description_html:
+                htmls.append(issue.description_html)
+            if comment is not None and comment.comment_html:
+                htmls.append(comment.comment_html)
+            if htmls:
+                mention_map = _gh_mention_map(htmls, project.workspace_id)
+
         payload = {
             "event_type": event_type,
             "activity_type": activity_type,
@@ -410,14 +523,18 @@ def dispatch_silo_work_item_event(
             "workspace_id": str(project.workspace_id),
             "project_id": str(project.id),
             "project_identifier": project.identifier,
+            "live_mapping_types": sorted(live_mapping_types),
             "issue": (
                 {
                     "id": str(issue.id),
                     "sequence_id": issue.sequence_id,
                     "name": issue.name,
+                    "description_html": issue.description_html or "",
+                    "state_id": str(issue.state_id) if issue.state_id else None,
                     "state_name": issue.state.name if issue.state_id else None,
                     "state_group": issue.state.group if issue.state_id else None,
                     "priority": issue.priority,
+                    "labels": labels,
                 }
                 if issue
                 else None
@@ -432,6 +549,14 @@ def dispatch_silo_work_item_event(
                 else None
             ),
             "comment_text": _render_comment_for_slack(comment, project.workspace_id) if comment else None,
+            "comment": (
+                {
+                    "id": str(comment.id),
+                    "comment_html": comment.comment_html or "",
+                }
+                if comment
+                else None
+            ),
             "state_change": (
                 {
                     "from_name": prev_state.name if prev_state else None,
@@ -443,6 +568,7 @@ def dispatch_silo_work_item_event(
                 else None
             ),
             "dm_targets": dm_targets,
+            "mention_map": mention_map,
         }
 
         body = json.dumps(payload)

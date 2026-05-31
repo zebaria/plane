@@ -35,6 +35,14 @@ export const config = {
   // fallback would silently leave service-to-service auth wide open.
   hmacSecret: required("SILO_HMAC_SECRET_KEY", process.env.SILO_ENV === "prod" ? undefined : "dev-insecure-silo-hmac"),
   apiInternalBaseUrl: process.env.API_INTERNAL_BASE_URL ?? "http://localhost:8800",
+  // Phase 4g SSRF guard: comma-separated allowlist of GitHub
+  // Enterprise Server origins (e.g. "https://ghe.acme.com"). A GHES
+  // install/oauth request is rejected unless its origin is listed
+  // here. Empty by default — cloud github.com needs no entry.
+  githubGhesAllowedHosts: (process.env.GITHUB_GHES_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean),
 };
 
 let slackConfig: SlackProviderConfig | null = null;

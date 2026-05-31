@@ -31,10 +31,19 @@ import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
 import { loadGithubOAuthSecrets, writeGithubAppSecrets } from "../secrets";
 import { callGithubAsApp, convertManifest, newCsrfState } from "./api";
+import { installNewUrlFor, manifestUrlFor, validateGhesOrigin, webBaseFor } from "./host";
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 
-type StateEntry = { workspaceSlug: string; userId: string; createdAt: number };
+type StateEntry = {
+  workspaceSlug: string;
+  userId: string;
+  // Phase 4g: empty/undefined → cloud github.com. When set, every
+  // GH call for this install (manifest convert, installation token,
+  // repo CRUD) swaps to <ghesBaseUrl>/api/v3.
+  ghesBaseUrl?: string;
+  createdAt: number;
+};
 const installStateStore = new Map<string, StateEntry>();
 
 setInterval(() => {
@@ -44,9 +53,9 @@ setInterval(() => {
   }
 }, STATE_TTL_MS).unref();
 
-const issueInstallState = (workspaceSlug: string, userId: string): string => {
+const issueInstallState = (workspaceSlug: string, userId: string, ghesBaseUrl?: string): string => {
   const token = newCsrfState();
-  installStateStore.set(token, { workspaceSlug, userId, createdAt: Date.now() });
+  installStateStore.set(token, { workspaceSlug, userId, ghesBaseUrl, createdAt: Date.now() });
   return token;
 };
 
@@ -66,25 +75,47 @@ const loadManifest = (env: string): Record<string, unknown> => {
   return JSON.parse(readFileSync(file, "utf8"));
 };
 
-const renderManifestForm = (env: string): string => {
+// Encode (env, ghesHost) into the manifest state. GitHub round-trips
+// it unchanged in the redirect, so we read it back in the callback.
+// Exported for unit testing the round-trip.
+export const encodeManifestState = (env: string, ghesHost?: string): string =>
+  ghesHost ? `${env}|${encodeURIComponent(ghesHost)}` : env;
+
+export const decodeManifestState = (raw: string): { env: string; ghesBaseUrl?: string } => {
+  const [env, encHost] = raw.split("|", 2);
+  return { env, ghesBaseUrl: encHost ? decodeURIComponent(encHost) : undefined };
+};
+
+// Escape values reflected into the bootstrap HTML. `org` is free-form
+// query input and `ghesHost`, though allowlist-validated, is still
+// user-influenced — neither must be able to inject markup (CodeQL
+// js/reflected-xss). `env` is already constrained to a fixed set but
+// we escape it too for uniformity.
+const htmlEscape = (s: string): string =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+const renderManifestForm = (env: string, org: string, ghesHost?: string): string => {
   const manifest = loadManifest(env);
-  // Self-posting form. The manifest JSON is sent in a hidden input
-  // named `manifest`. GitHub will redirect back to the App's
-  // `redirect_url` (which we set to silo's manifest/callback) with
-  // a `code` query param.
-  const target = `https://github.com/organizations/zebaria/settings/apps/new`;
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Plane GitHub App bootstrap (${env})</title></head>
+  const target = manifestUrlFor(org, ghesHost);
+  const stateValue = encodeManifestState(env, ghesHost);
+  const envH = htmlEscape(env);
+  const orgH = htmlEscape(org);
+  const whereH = ghesHost ? ` (GHES at ${htmlEscape(ghesHost)})` : "";
+  // `target` is built from webBaseFor() (cloud constant or the
+  // allowlist-validated GHES origin) + an encodeURIComponent'd org, so
+  // it's already a safe URL; stateValue is URL-encoded for the query.
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Plane GitHub App bootstrap (${envH}${whereH})</title></head>
 <body>
-<h1>Create GitHub App for env=${env}</h1>
+<h1>Create GitHub App for env=${envH}${whereH}</h1>
 <p>Click the button to register a new GitHub App against the
-<code>zebaria</code> org. After GitHub creates it you'll be redirected
+<code>${orgH}</code> org. After GitHub creates it you'll be redirected
 back to silo, which will store the App credentials in AWS Secrets
-Manager at <code>/${env}/plane-github</code>. Then click
+Manager at <code>/${envH}/plane-github</code>. Then click
 <strong>Install App</strong> on the new App's page to install it
 into the org and pick repos.</p>
-<form method="post" action="${target}?state=${env}">
+<form method="post" action="${htmlEscape(target)}?state=${encodeURIComponent(stateValue)}">
   <input type="hidden" name="manifest" value='${JSON.stringify(manifest).replace(/'/g, "&#39;")}'>
-  <button type="submit">Create GitHub App for ${env}</button>
+  <button type="submit">Create GitHub App for ${envH}${whereH}</button>
 </form>
 </body></html>`;
 };
@@ -98,8 +129,21 @@ export const githubOAuthRouter = (): Router => {
       res.status(400).type("text/plain").send("env must be one of: local, dev, prod");
       return;
     }
-    res.setHeader("Content-Security-Policy", "default-src 'self'; form-action https://github.com");
-    res.type("html").send(renderManifestForm(env));
+    // GHES bootstrap: pass `?ghes_host=https://ghe.acme.com&org=acme`.
+    // Cloud install defaults to the zebaria org. The GHES origin is
+    // SSRF-guarded against the operator allowlist before it can drive
+    // any server-side URL (the manifest target's CSP form-action would
+    // otherwise be attacker-controlled).
+    const ghesCheck = validateGhesOrigin(req.query.ghes_host as string | undefined, config.githubGhesAllowedHosts);
+    if (!ghesCheck.ok) {
+      res.status(400).type("text/plain").send(ghesCheck.error);
+      return;
+    }
+    const ghesHost = ghesCheck.origin;
+    const org = String(req.query.org ?? "").trim() || "zebaria";
+    const formAction = webBaseFor(ghesHost);
+    res.setHeader("Content-Security-Policy", `default-src 'self'; form-action ${formAction}`);
+    res.type("html").send(renderManifestForm(env, org, ghesHost));
   });
 
   r.get(
@@ -108,10 +152,19 @@ export const githubOAuthRouter = (): Router => {
       const code = String(req.query.code ?? "").trim();
       // GitHub returns our `state` parameter unchanged — we use it to
       // identify which env we're bootstrapping (set in the form action
-      // above).
-      const env = String(req.query.state ?? "").trim();
+      // above) and, for GHES, where to swap api.github.com.
+      const rawState = String(req.query.state ?? "").trim();
+      const { env, ghesBaseUrl } = decodeManifestState(rawState);
       if (!code || !["local", "dev", "prod"].includes(env)) {
         res.status(400).type("text/plain").send("missing code or invalid state");
+        return;
+      }
+      // `state` round-trips through GitHub but is ultimately
+      // caller-influenced, so re-validate the GHES origin here too —
+      // convertManifest would otherwise POST the OAuth code to it.
+      const ghesCheck = validateGhesOrigin(ghesBaseUrl, config.githubGhesAllowedHosts);
+      if (!ghesCheck.ok) {
+        res.status(400).type("text/plain").send(ghesCheck.error);
         return;
       }
       // Refuse to overwrite an existing install — re-running the
@@ -127,7 +180,7 @@ export const githubOAuthRouter = (): Router => {
           );
         return;
       }
-      const conv = await convertManifest(code);
+      const conv = await convertManifest(code, ghesCheck.origin);
       const secrets = {
         app_id: String(conv.id),
         app_slug: conv.slug,
@@ -161,10 +214,16 @@ export const githubOAuthRouter = (): Router => {
           oauthClientSecret: oauth?.client_secret ?? "",
         });
       }
+      // `conv.html_url` comes from the manifest-conversion response of a
+      // user-influenced host (GHES), so escape it before reflecting it
+      // into HTML (CodeQL js/reflected-xss). `env` is fixed-set but
+      // escaped for uniformity.
+      const envH = htmlEscape(env);
+      const htmlUrlH = htmlEscape(conv.html_url ?? "");
       res.type("html").send(
-        `<!doctype html><html><body><h1>App created for env=${env}</h1>
-<p>Stored in AWS Secrets Manager at <code>/${env}/plane-github</code>.</p>
-<p>Next step: visit <a href="${conv.html_url}">${conv.html_url}</a>
+        `<!doctype html><html><body><h1>App created for env=${envH}</h1>
+<p>Stored in AWS Secrets Manager at <code>/${envH}/plane-github</code>.</p>
+<p>Next step: visit <a href="${htmlUrlH}">${htmlUrlH}</a>
 and click <strong>Install App</strong> to install it into the
 zebaria org and choose repos.</p>
 </body></html>`
@@ -179,13 +238,22 @@ zebaria org and choose repos.</p>
       res.status(400).json({ error: "workspaceSlug and userId required" });
       return;
     }
+    // GHES origin (e.g. "https://ghe.acme.com"). Empty/absent → cloud.
+    // SSRF-guarded: the stored origin later drives App-JWT-bearing
+    // calls in the callback, so it must be on the operator allowlist.
+    const ghesCheck = validateGhesOrigin(req.query.ghesBaseUrl as string | undefined, config.githubGhesAllowedHosts);
+    if (!ghesCheck.ok) {
+      res.status(400).json({ error: ghesCheck.error });
+      return;
+    }
+    const ghesBaseUrl = ghesCheck.origin;
     const cfg = getGithubConfig();
     if (!cfg.appSlug) {
       res.status(503).json({ error: "github app not configured (missing app_slug)" });
       return;
     }
-    const state = issueInstallState(workspaceSlug, userId);
-    const url = `https://github.com/apps/${cfg.appSlug}/installations/new?state=${state}`;
+    const state = issueInstallState(workspaceSlug, userId, ghesBaseUrl);
+    const url = `${installNewUrlFor(cfg.appSlug, ghesBaseUrl)}?state=${state}`;
     res.json({ url });
   });
 
@@ -218,7 +286,7 @@ zebaria org and choose repos.</p>
         account: { login: string; id: number; type: string };
         repository_selection: "all" | "selected";
         permissions: Record<string, string>;
-      }>("GET", `/app/installations/${encodeURIComponent(installationId)}`);
+      }>("GET", `/app/installations/${encodeURIComponent(installationId)}`, undefined, entry.ghesBaseUrl);
       if (meta.status >= 300) {
         res.redirect(redirectErr(entry.workspaceSlug, `installation_lookup_${meta.status}`));
         return;
@@ -232,6 +300,9 @@ zebaria org and choose repos.</p>
         account_id: meta.data.account.id,
         account_type: meta.data.account.type,
         repository_selection: meta.data.repository_selection,
+        // Persisted in WorkspaceConnection.connection_data so the
+        // bindings endpoint can return ghes_base_url to silo.
+        ghes_base_url: entry.ghesBaseUrl ?? null,
       });
       if (installRes.status >= 300) {
         res.redirect(redirectErr(entry.workspaceSlug, `persist_${installRes.status}`));

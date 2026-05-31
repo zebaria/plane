@@ -126,6 +126,51 @@ cmd_stop() {
   ./zdev down
 }
 
+# Hard reset for when tsdown's --watch leaves a zombie node bound to
+# the silo/space port and the new build never picks up. This is the
+# fix-it-now button: kill every plane workspace node, every
+# react-router dev server, every tsdown watcher, and every leftover
+# `node --env-file=.env .` (silo/live entrypoint). Containers stay up;
+# rerun `./zstart` after to bring the host-side processes back.
+cmd_nuke() {
+  echo "==> Nuking host-side Plane node processes (containers untouched)"
+  rm -f "$PNPM_PID"
+
+  local patterns=(
+    "node.*plane/apps"
+    "node.*plane/packages"
+    "node.*plane/node_modules"
+    "react-router/dev/bin"
+    "tsdown/dist/run"
+    "node --env-file=.env"
+    "pnpm dev"
+    "turbo run dev"
+  )
+  for pat in "${patterns[@]}"; do
+    pkill -9 -f "$pat" 2>/dev/null && echo "    killed: $pat" || true
+  done
+
+  # Anything still bound to the dev ports? Kill it explicitly so the
+  # next `./zstart up` doesn't EADDRINUSE.
+  for port in 3000 3001 3002 3005 4000; do
+    local pids
+    pids=$(lsof -tiTCP:$port -sTCP:LISTEN 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+      echo "    port $port still held by: $pids — SIGKILL"
+      kill -9 $pids 2>/dev/null || true
+    fi
+  done
+
+  # Verify clean.
+  local survivors
+  survivors=$(pgrep -f "node.*plane/apps|react-router/dev/bin|tsdown/dist/run" 2>/dev/null || true)
+  if [[ -n "$survivors" ]]; then
+    echo "    WARN: survivors still running: $survivors"
+  else
+    echo "==> Clean. Run './zstart up' to bring it back."
+  fi
+}
+
 cmd_up() {
   local with_frontends="$1"
 
@@ -295,11 +340,12 @@ case "${1:-up}" in
   stop|down) cmd_stop ;;
   stopsvc)   shift; cmd_stop_svc "$@" ;;
   restart)   shift; cmd_restart "$@" ;;
+  nuke|kill) cmd_nuke ;;               # nuke host-side node procs when watch wedges
   logs)      shift; cmd_logs "$@" ;;
   status|ps) cmd_status ;;
   shell|sh|exec) shift; cmd_shell "$@" ;;
   *)
-    echo "usage: $0 [up|backend|deps|stop|stopsvc <svc>...|restart [svc]|logs [svc|frontends]|status|shell [svc]]"
+    echo "usage: $0 [up|backend|deps|stop|stopsvc <svc>...|restart [svc]|nuke|logs [svc|frontends]|status|shell [svc]]"
     exit 2
     ;;
 esac
