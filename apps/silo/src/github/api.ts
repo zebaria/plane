@@ -18,7 +18,7 @@ import { createSign, randomBytes } from "node:crypto";
 
 import axios, { type AxiosResponse } from "axios";
 
-import { getGithubConfig } from "../config";
+import { getGithubConfig } from "./config";
 import { apiBaseFor } from "./host";
 
 const b64url = (b: Buffer | string): string =>

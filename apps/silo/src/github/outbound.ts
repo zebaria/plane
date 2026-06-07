@@ -21,8 +21,9 @@
 import TurndownService from "turndown";
 
 import { callDjango } from "../django-client";
-import type { IntegrationDispatcher, WorkItemEvent } from "../notifications";
+import type { IntegrationDispatcher, WorkItemEvent } from "../events";
 import { callGithub } from "./api";
+import { isGithubConfigured } from "./config";
 import { persistIssueLink, type RepoBinding } from "./django";
 
 const turndown = new TurndownService({
@@ -401,6 +402,18 @@ const dispatchForBinding = async (
 };
 
 const dispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
+  // If GitHub isn't configured (no secret loaded at startup), don't try
+  // to mirror — calling GitHub would throw on getGithubConfig(). A stale
+  // repo binding can outlive its config (e.g. secret removed, or never
+  // bootstrapped in this env), so gate on the integration, not just the
+  // binding. No-op with a clear note rather than crashing the dispatcher.
+  if (!isGithubConfigured()) {
+    console.warn(
+      `[silo] github outbound skipped for project=${event.project_id}: GitHub integration not configured ` +
+        `(a repo binding exists but no GitHub secret is loaded — bootstrap GitHub or remove the binding)`
+    );
+    return;
+  }
   const bindings = await fetchRepoBindingsForProject(event.workspace_slug, event.project_id);
   if (bindings.length === 0) return;
   console.log(

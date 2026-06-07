@@ -2,21 +2,18 @@
  * Copyright (c) 2026-present Zebaria.
  * SPDX-License-Identifier: AGPL-3.0-only
  *
- * Inbound: Plane Django → silo, work-item lifecycle events fanned
- * out to subscribed channels (and, in later phases, DMs).
+ * Inbound: Plane Django → silo, work-item lifecycle events fanned out to
+ * each integration's outbound dispatcher.
  *
  *   POST /silo/api/notifications/work-item-event
  *
- * Authenticated via the same silo↔Django HMAC scheme used in the
- * other direction. Django signs with the shared
- * SILO_HMAC_SECRET_KEY; we verify here.
+ * Authenticated via the same silo↔Django HMAC scheme used in the other
+ * direction. Django signs with the shared SILO_HMAC_SECRET_KEY; we verify
+ * here. Payload shape — see plane/bgtasks/silo_notification_task.py.
  *
- * Payload shape — see plane/bgtasks/silo_notification_task.py.
- *
- * For now we only handle the Slack `slack-channel-notification`
- * mappings; the per-user DM path (assignment, mention) is a
- * follow-up that requires a different lookup (WorkspaceUserConnection
- * → bot DM) and is queued behind this.
+ * This router is integration-agnostic: it verifies, parses, acks, and
+ * hands the event to every registered dispatcher (see integrations.ts).
+ * Each dispatcher gates itself on the event's live_mapping_types.
  */
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -25,99 +22,11 @@ import type { Request, Response, Router } from "express";
 import express from "express";
 
 import { config } from "./config";
-import { callDjango } from "./django-client";
-import { githubOutboundDispatcher } from "./github/outbound";
-import { callSlackApiForTeam } from "./slack/api";
+import type { WorkItemEvent } from "./events";
+import { integrationDispatchers } from "./integrations";
 
 const NOTIFICATION_PATH = "/api/notifications/work-item-event";
 const HMAC_SKEW_SECONDS = 5 * 60;
-
-type IssuePayload = {
-  id: string;
-  sequence_id: number;
-  name: string;
-  state_name: string | null;
-  state_group: string | null;
-  priority: string | null;
-};
-
-type ActorPayload = {
-  id: string;
-  display_name: string;
-  email: string;
-};
-
-type StateChangePayload = {
-  from_name: string | null;
-  from_group: string | null;
-  to_name: string | null;
-  to_group: string | null;
-};
-
-type DmTarget = {
-  plane_user_id: string;
-  slack_user_id: string;
-};
-
-export type WorkItemEvent = {
-  event_type:
-    | "work_item.created"
-    | "work_item.updated"
-    | "work_item.state_changed"
-    | "work_item.commented"
-    | "work_item.completed";
-  activity_type: string;
-  workspace_slug: string;
-  workspace_id: string;
-  project_id: string;
-  project_identifier: string;
-  // Integration mapping types live on the project (e.g.
-  // "slack-channel-notification", "github-repo"). Dispatchers gate
-  // themselves on this so we don't, say, build GH state for a
-  // Slack-only project.
-  live_mapping_types: string[];
-  issue:
-    | (IssuePayload & {
-        description_html?: string;
-        state_id?: string | null;
-        labels?: { id: string; name: string }[];
-      })
-    | null;
-  actor: ActorPayload | null;
-  comment_text: string | null;
-  comment?: { id: string; comment_html: string } | null;
-  state_change: StateChangePayload | null;
-  dm_targets: DmTarget[];
-  // Plane user_id → external login map used by integration-specific
-  // mention rewrites (currently only GitHub: rewrites
-  // `<mention-component>` tags into `@gh_login`). Empty / absent
-  // when no mapped users are mentioned in the event's html bodies.
-  mention_map?: Record<string, string>;
-};
-
-// A dispatcher decides whether it cares about an event (based on
-// live_mapping_types + event_type) and, if so, fans it out to its
-// integration's API. Each integration owns its own dispatcher.
-export type IntegrationDispatcher = {
-  name: string;
-  // The WorkspaceEntityConnection.type this dispatcher handles. Used
-  // for the gate against `live_mapping_types`.
-  mappingType: string;
-  dispatch: (event: WorkItemEvent, webBaseUrl: string) => Promise<void>;
-};
-
-type ProjectMapping = {
-  id: string;
-  workspace_connection_id: string;
-  connection_type: string;
-  connection_team_id: string;
-  project_id: string | null;
-  type: string;
-  entity_type: string;
-  entity_id: string;
-  entity_slug: string | null;
-  config: { events?: string[] } | null;
-};
 
 const verifyDjangoHmac = (
   rawBody: Buffer,
@@ -143,247 +52,14 @@ const verifyDjangoHmac = (
   return { ok: true };
 };
 
-// Slack mrkdwn treats `<`, `>`, `&` as control characters; raw user input
-// (issue names, display names, state names) inside link tags would break
-// rendering. Escape with HTML-entity-style replacements per Slack docs.
-const slackEscape = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-const buildBlocks = (event: WorkItemEvent, webBaseUrl: string): Record<string, unknown>[] => {
-  const issue = event.issue;
-  if (!issue)
-    return [{ type: "section", text: { type: "mrkdwn", text: `_(no issue payload for ${event.event_type})_` } }];
-
-  const ref = slackEscape(`${event.project_identifier}-${issue.sequence_id}`);
-  const url = `${webBaseUrl}/${event.workspace_slug}/projects/${event.project_id}/issues/${issue.id}`;
-  const actorName = slackEscape(event.actor?.display_name ?? event.actor?.email ?? "someone");
-  const issueName = slackEscape(issue.name);
-
-  const sc = event.state_change;
-  const fromName = sc?.from_name ? slackEscape(sc.from_name) : null;
-  const toName = sc?.to_name ? slackEscape(sc.to_name) : null;
-  const stateTransition = fromName && toName ? `${fromName} → *${toName}*` : null;
-
-  let leadText = "";
-  switch (event.event_type) {
-    case "work_item.created":
-      leadText = `*${actorName}* created *<${url}|${ref}: ${issueName}>*`;
-      break;
-    case "work_item.state_changed":
-      leadText = stateTransition
-        ? `*${actorName}* moved *<${url}|${ref}: ${issueName}>* — ${stateTransition}`
-        : `*${actorName}* updated *<${url}|${ref}: ${issueName}>*`;
-      break;
-    case "work_item.commented":
-      leadText = `*${actorName}* commented on *<${url}|${ref}: ${issueName}>*`;
-      break;
-    case "work_item.completed": {
-      const verb = sc?.to_group === "cancelled" ? "cancelled" : "completed";
-      const tail = toName ?? slackEscape(issue.state_name ?? "");
-      leadText = `*${actorName}* ${verb} *<${url}|${ref}: ${issueName}>* — ${tail}`;
-      break;
-    }
-  }
-
-  const blocks: Record<string, unknown>[] = [{ type: "section", text: { type: "mrkdwn", text: leadText } }];
-
-  if (event.event_type === "work_item.commented" && event.comment_text) {
-    const trimmed = event.comment_text.length > 600 ? `${event.comment_text.slice(0, 600)}…` : event.comment_text;
-    blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: `> ${trimmed.replace(/\n/g, "\n> ")}` },
-    });
-  }
-
-  // Action row on every event. Reply only makes sense for the commented
-  // path, but Assign-me / View-in-Plane apply to all of them. Embedding
-  // the work-item ref in the button value avoids a Django round-trip in
-  // the action handler.
-  const actionContext = JSON.stringify({
-    workspace_slug: event.workspace_slug,
-    project_id: event.project_id,
-    issue_id: issue.id,
-    project_identifier: event.project_identifier,
-    sequence_id: issue.sequence_id,
-    issue_name: issue.name,
-  });
-  const actionElements: Record<string, unknown>[] = [];
-  if (event.event_type === "work_item.commented") {
-    actionElements.push({
-      type: "button",
-      text: { type: "plain_text", text: "Reply" },
-      action_id: "plane_reply_comment",
-      value: actionContext,
-    });
-  }
-  actionElements.push({
-    type: "button",
-    text: { type: "plain_text", text: "Assign me" },
-    action_id: "plane_assign_me",
-    value: actionContext,
-  });
-  actionElements.push({
-    type: "button",
-    text: { type: "plain_text", text: "Change state" },
-    action_id: "plane_change_state",
-    value: actionContext,
-  });
-  actionElements.push({
-    type: "button",
-    text: { type: "plain_text", text: "View in Plane" },
-    url,
-  });
-  blocks.push({ type: "actions", elements: actionElements });
-
-  const ctx: string[] = [];
-  if (issue.state_name) ctx.push(issue.state_name);
-  if (issue.priority && issue.priority !== "none") ctx.push(`priority: ${issue.priority}`);
-  if (ctx.length > 0) {
-    blocks.push({
-      type: "context",
-      elements: ctx.map((t) => ({ type: "mrkdwn", text: t })),
-    });
-  }
-  return blocks;
-};
-
-const fetchSlackChannelMappings = async (workspaceSlug: string, projectId: string): Promise<ProjectMapping[]> => {
-  const r = await callDjango<{ mappings: ProjectMapping[] }>("POST", "/api/v1/silo/project-mappings/", {
-    workspace_slug: workspaceSlug,
-    project_id: projectId,
-    type: "slack-channel-notification",
-  });
-  if (r.status >= 300) {
-    throw new Error(`project-mappings fetch failed: ${r.status} ${JSON.stringify(r.data)}`);
-  }
-  return (r.data.mappings ?? []).filter((m) => m.connection_type === "slack");
-};
-
-const slackDispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
-  // Slack-side message links MUST use a publicly resolvable URL —
-  // Slack's renderers click them. Caller already passes
-  // PLANE_PUBLIC_URL or fallback.
-  const blocks = buildBlocks(event, webBaseUrl);
-  const fallbackText = `${event.project_identifier}-${event.issue?.sequence_id ?? "?"}: ${event.issue?.name ?? ""}`;
-
-  console.log(
-    `[silo] dispatch event=${event.event_type} ws=${event.workspace_slug} project=${event.project_id} dm_targets=${event.dm_targets.length}`
-  );
-
-  // 1. Channel fan-out for project-bound mappings.
-  const mappings = await fetchSlackChannelMappings(event.workspace_slug, event.project_id);
-  console.log(`[silo] dispatch channel mappings=${mappings.length}`);
-
-  // teamId is needed for DMs too; reuse the mappings' team_id when
-  // present (any mapping carries the workspace's Slack team), but
-  // fall back to looking up workspace-connections via Django if not.
-  let teamId: string | null = mappings[0]?.connection_team_id ?? null;
-
-  // Channel fan-out runs in parallel. Slack's per-bot postMessage rate
-  // limit is 1/sec/channel and ~50/sec total for chat.postMessage —
-  // we'd hit that fanning out to dozens of channels for one event,
-  // not for one event to 2-3 channels. Slack returns 429 with
-  // Retry-After if we ever do; the SDK doesn't auto-retry today
-  // (TODO if/when we have hot channels).
-  const eligibleMappings = mappings.filter(
-    (m) => (m.config?.events ?? []).length === 0 || (m.config?.events ?? []).includes(event.event_type)
-  );
-  // Per-channel try/catch so a network/DNS hiccup on one mapping
-  // doesn't cancel the rest of the fan-out.
-  await Promise.all(
-    eligibleMappings.map(async (m) => {
-      try {
-        const result = await callSlackApiForTeam("chat.postMessage", m.connection_team_id, {
-          channel: m.entity_id,
-          blocks,
-          text: fallbackText,
-          unfurl_links: false,
-          unfurl_media: false,
-        });
-        if (!result || !result.ok) {
-          console.error(`[silo] chat.postMessage to ${m.entity_id} failed: ${result?.error ?? "no-team-context"}`);
-        }
-      } catch (err) {
-        console.error(`[silo] chat.postMessage to ${m.entity_id} threw:`, err);
-      }
-    })
-  );
-
-  // 2. Per-user DMs (assignment / mention).
-  if (event.dm_targets.length > 0 && !teamId) {
-    // No project channel mappings, so we don't have a team_id from
-    // them. Look up the workspace's Slack install location via Django.
-    teamId = await fetchSlackTeamIdForWorkspace(event.workspace_slug);
-  }
-  if (event.dm_targets.length > 0 && teamId) {
-    const dmTeamId = teamId;
-    // DMs run in parallel — one user per request, no shared rate-limit
-    // bucket between users on chat.postMessage.
-    await Promise.all(
-      event.dm_targets.map(async (dm) => {
-        try {
-          console.log(`[silo] DM attempt slack_user=${dm.slack_user_id}`);
-          const opened = await callSlackApiForTeam<{
-            ok: boolean;
-            error?: string;
-            channel?: { id: string };
-          }>("conversations.open", dmTeamId, { users: dm.slack_user_id });
-          if (!opened || !opened.ok || !opened.channel?.id) {
-            console.error(
-              `[silo] conversations.open for ${dm.slack_user_id} failed: ${opened?.error ?? "no-team-context"}`
-            );
-            return;
-          }
-          console.log(`[silo] DM channel opened: ${opened.channel.id}`);
-          const r = await callSlackApiForTeam("chat.postMessage", dmTeamId, {
-            channel: opened.channel.id,
-            blocks,
-            text: fallbackText,
-            unfurl_links: false,
-            unfurl_media: false,
-          });
-          if (!r || !r.ok) {
-            console.error(`[silo] DM postMessage to ${dm.slack_user_id} failed: ${r?.error ?? "no-team-context"}`);
-          } else {
-            console.log(`[silo] DM postMessage to ${dm.slack_user_id} ok`);
-          }
-        } catch (err) {
-          console.error(`[silo] DM to ${dm.slack_user_id} threw:`, err);
-        }
-      })
-    );
-  } else if (event.dm_targets.length > 0) {
-    console.warn(`[silo] dm_targets present but no teamId — skipping DMs`);
-  }
-};
-
-const fetchSlackTeamIdForWorkspace = async (workspaceSlug: string): Promise<string | null> => {
-  // Ask Django for any live mapping in this workspace; project_id is
-  // optional on the endpoint. Any mapping carries the workspace's Slack
-  // team_id, which is all we need to open a DM.
-  const r = await callDjango<{ mappings: ProjectMapping[] }>("POST", "/api/v1/silo/project-mappings/", {
-    workspace_slug: workspaceSlug,
-  });
-  if (r.status >= 300) return null;
-  return r.data.mappings?.[0]?.connection_team_id ?? null;
-};
-
-// Slack dispatcher exposed via the registry. Adding a new integration
-// is a one-line registration here + a new module exporting an
-// `IntegrationDispatcher`. The orchestrator below stays untouched.
-const slackDispatcher: IntegrationDispatcher = {
-  name: "slack",
-  mappingType: "slack-channel-notification",
-  dispatch: slackDispatch,
-};
-
-const dispatchers: IntegrationDispatcher[] = [slackDispatcher, githubOutboundDispatcher];
-
 const runDispatchers = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
   // Each integration gates itself on `live_mapping_types`. Run them in
-  // parallel — a slow GitHub call shouldn't block the Slack post, and
-  // a Slack post failure shouldn't block the GH mirror.
+  // parallel — a slow GitHub call shouldn't block the Slack post, and a
+  // Slack post failure shouldn't block the GH mirror. Dispatchers come
+  // from the integration registry, so this stays untouched as
+  // integrations are added.
   await Promise.all(
-    dispatchers
+    integrationDispatchers()
       .filter((d) => event.live_mapping_types?.includes(d.mappingType))
       .map(async (d) => {
         try {
@@ -429,10 +105,10 @@ export const notificationsRouter = (): Router => {
     // Ack immediately; do work async.
     res.status(200).end();
 
-    // Slack-side message links MUST use a publicly resolvable URL —
+    // Outbound message links MUST use a publicly resolvable URL —
     // Slack's renderers click them. Prefer PLANE_PUBLIC_URL (the
-    // tunnel/ALB hostname); fall back to WEB_BASE_URL for envs
-    // where they're the same.
+    // tunnel/ALB hostname); fall back to WEB_BASE_URL for envs where
+    // they're the same.
     const webBaseUrl = process.env.PLANE_PUBLIC_URL ?? process.env.WEB_BASE_URL ?? "http://localhost:3000";
     runDispatchers(event, webBaseUrl).catch((err) => {
       console.error("[silo] notifications dispatch crashed:", err);

@@ -26,10 +26,11 @@ import { join } from "node:path";
 import type { Request, Response, Router } from "express";
 import express from "express";
 
-import { config, getGithubConfig, isGithubConfigured, setGithubConfig } from "../config";
+import { config } from "../config";
+import { getGithubConfig, githubGhesAllowedHosts, isGithubConfigured, setGithubConfig } from "./config";
 import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
-import { loadGithubOAuthSecrets, writeGithubAppSecrets } from "../secrets";
+import { loadGithubOAuthSecrets, writeGithubAppSecrets } from "./secrets";
 import { callGithubAsApp, convertManifest, newCsrfState } from "./api";
 import { installNewUrlFor, manifestUrlFor, validateGhesOrigin, webBaseFor } from "./host";
 
@@ -134,7 +135,7 @@ export const githubOAuthRouter = (): Router => {
     // SSRF-guarded against the operator allowlist before it can drive
     // any server-side URL (the manifest target's CSP form-action would
     // otherwise be attacker-controlled).
-    const ghesCheck = validateGhesOrigin(req.query.ghes_host as string | undefined, config.githubGhesAllowedHosts);
+    const ghesCheck = validateGhesOrigin(req.query.ghes_host as string | undefined, githubGhesAllowedHosts);
     if (!ghesCheck.ok) {
       res.status(400).type("text/plain").send(ghesCheck.error);
       return;
@@ -162,7 +163,7 @@ export const githubOAuthRouter = (): Router => {
       // `state` round-trips through GitHub but is ultimately
       // caller-influenced, so re-validate the GHES origin here too —
       // convertManifest would otherwise POST the OAuth code to it.
-      const ghesCheck = validateGhesOrigin(ghesBaseUrl, config.githubGhesAllowedHosts);
+      const ghesCheck = validateGhesOrigin(ghesBaseUrl, githubGhesAllowedHosts);
       if (!ghesCheck.ok) {
         res.status(400).type("text/plain").send(ghesCheck.error);
         return;
@@ -241,7 +242,7 @@ zebaria org and choose repos.</p>
     // GHES origin (e.g. "https://ghe.acme.com"). Empty/absent → cloud.
     // SSRF-guarded: the stored origin later drives App-JWT-bearing
     // calls in the callback, so it must be on the operator allowlist.
-    const ghesCheck = validateGhesOrigin(req.query.ghesBaseUrl as string | undefined, config.githubGhesAllowedHosts);
+    const ghesCheck = validateGhesOrigin(req.query.ghesBaseUrl as string | undefined, githubGhesAllowedHosts);
     if (!ghesCheck.ok) {
       res.status(400).json({ error: ghesCheck.error });
       return;

@@ -9,19 +9,10 @@ import helmet from "helmet";
 
 import { config } from "./config";
 import { callDjango } from "./django-client";
-import { githubOAuthRouter } from "./github/oauth";
-import { githubReposRouter } from "./github/repos";
-import { githubUserOAuthRouter } from "./github/user-oauth";
-import { githubWebhookRouter } from "./github/webhook";
+import { mountIntegrations } from "./integrations";
 import { notificationsRouter } from "./notifications";
-import { slackChannelsRouter } from "./slack/channels";
-import { slackCommandsRouter } from "./slack/commands";
-import { slackEventsRouter } from "./slack/events";
-import { slackInteractionsRouter } from "./slack/interactions";
-import { slackOAuthRouter } from "./slack/oauth";
-import { slackUserOAuthRouter } from "./slack/user-oauth";
 
-export function createApp(): Express {
+export function createApp(configuredIntegrations: Set<string> = new Set()): Express {
   const app = express();
   app.use(helmet());
   app.use(
@@ -70,17 +61,15 @@ export function createApp(): Express {
     }
   });
 
-  router.use(slackOAuthRouter());
-  router.use(slackUserOAuthRouter());
-  router.use(slackCommandsRouter());
-  router.use(slackInteractionsRouter());
-  router.use(slackEventsRouter());
-  router.use(slackChannelsRouter());
+  // Notifications (outbound dispatch) is always available — it gates per
+  // event on live mapping types, not on a single provider being set up.
   router.use(notificationsRouter());
-  router.use(githubOAuthRouter());
-  router.use(githubUserOAuthRouter());
-  router.use(githubReposRouter());
-  router.use(githubWebhookRouter());
+
+  // Each integration mounts its own routes, but only if it loaded
+  // successfully at startup. An unconfigured integration's endpoints
+  // simply don't exist (404) rather than erroring — "not set up" isn't a
+  // failure state. See integrations.ts.
+  mountIntegrations(router, configuredIntegrations);
 
   app.use(config.basePath, router);
   return app;

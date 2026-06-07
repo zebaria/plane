@@ -1,0 +1,242 @@
+/**
+ * Copyright (c) 2026-present Zebaria.
+ * SPDX-License-Identifier: AGPL-3.0-only
+ *
+ * Slack outbound dispatcher: fans a work-item event out to Slack channels
+ * and DMs. Registered as the Slack integration's dispatcher (see
+ * ./index.ts) and invoked by the notifications router via the registry.
+ */
+
+import { callDjango } from "../django-client";
+import type { IntegrationDispatcher, ProjectMapping, WorkItemEvent } from "../events";
+import { callSlackApiForTeam } from "./api";
+
+// Slack mrkdwn treats `<`, `>`, `&` as control characters; raw user input
+// (issue names, display names, state names) inside link tags would break
+// rendering. Escape with HTML-entity-style replacements per Slack docs.
+const slackEscape = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const buildBlocks = (event: WorkItemEvent, webBaseUrl: string): Record<string, unknown>[] => {
+  const issue = event.issue;
+  if (!issue)
+    return [{ type: "section", text: { type: "mrkdwn", text: `_(no issue payload for ${event.event_type})_` } }];
+
+  const ref = slackEscape(`${event.project_identifier}-${issue.sequence_id}`);
+  const url = `${webBaseUrl}/${event.workspace_slug}/projects/${event.project_id}/issues/${issue.id}`;
+  const actorName = slackEscape(event.actor?.display_name ?? event.actor?.email ?? "someone");
+  const issueName = slackEscape(issue.name);
+
+  const sc = event.state_change;
+  const fromName = sc?.from_name ? slackEscape(sc.from_name) : null;
+  const toName = sc?.to_name ? slackEscape(sc.to_name) : null;
+  const stateTransition = fromName && toName ? `${fromName} → *${toName}*` : null;
+
+  let leadText = "";
+  switch (event.event_type) {
+    case "work_item.created":
+      leadText = `*${actorName}* created *<${url}|${ref}: ${issueName}>*`;
+      break;
+    case "work_item.state_changed":
+      leadText = stateTransition
+        ? `*${actorName}* moved *<${url}|${ref}: ${issueName}>* — ${stateTransition}`
+        : `*${actorName}* updated *<${url}|${ref}: ${issueName}>*`;
+      break;
+    case "work_item.commented":
+      leadText = `*${actorName}* commented on *<${url}|${ref}: ${issueName}>*`;
+      break;
+    case "work_item.completed": {
+      const verb = sc?.to_group === "cancelled" ? "cancelled" : "completed";
+      const tail = toName ?? slackEscape(issue.state_name ?? "");
+      leadText = `*${actorName}* ${verb} *<${url}|${ref}: ${issueName}>* — ${tail}`;
+      break;
+    }
+  }
+
+  const blocks: Record<string, unknown>[] = [{ type: "section", text: { type: "mrkdwn", text: leadText } }];
+
+  if (event.event_type === "work_item.commented" && event.comment_text) {
+    const trimmed = event.comment_text.length > 600 ? `${event.comment_text.slice(0, 600)}…` : event.comment_text;
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `> ${trimmed.replace(/\n/g, "\n> ")}` },
+    });
+  }
+
+  // Action row on every event. Reply only makes sense for the commented
+  // path, but Assign-me / View-in-Plane apply to all of them. Embedding
+  // the work-item ref in the button value avoids a Django round-trip in
+  // the action handler.
+  const actionContext = JSON.stringify({
+    workspace_slug: event.workspace_slug,
+    project_id: event.project_id,
+    issue_id: issue.id,
+    project_identifier: event.project_identifier,
+    sequence_id: issue.sequence_id,
+    issue_name: issue.name,
+  });
+  const actionElements: Record<string, unknown>[] = [];
+  if (event.event_type === "work_item.commented") {
+    actionElements.push({
+      type: "button",
+      text: { type: "plain_text", text: "Reply" },
+      action_id: "plane_reply_comment",
+      value: actionContext,
+    });
+  }
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "Assign me" },
+    action_id: "plane_assign_me",
+    value: actionContext,
+  });
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "Change state" },
+    action_id: "plane_change_state",
+    value: actionContext,
+  });
+  actionElements.push({
+    type: "button",
+    text: { type: "plain_text", text: "View in Plane" },
+    url,
+  });
+  blocks.push({ type: "actions", elements: actionElements });
+
+  const ctx: string[] = [];
+  if (issue.state_name) ctx.push(issue.state_name);
+  if (issue.priority && issue.priority !== "none") ctx.push(`priority: ${issue.priority}`);
+  if (ctx.length > 0) {
+    blocks.push({
+      type: "context",
+      elements: ctx.map((t) => ({ type: "mrkdwn", text: t })),
+    });
+  }
+  return blocks;
+};
+
+const fetchSlackChannelMappings = async (workspaceSlug: string, projectId: string): Promise<ProjectMapping[]> => {
+  const r = await callDjango<{ mappings: ProjectMapping[] }>("POST", "/api/v1/silo/project-mappings/", {
+    workspace_slug: workspaceSlug,
+    project_id: projectId,
+    type: "slack-channel-notification",
+  });
+  if (r.status >= 300) {
+    throw new Error(`project-mappings fetch failed: ${r.status} ${JSON.stringify(r.data)}`);
+  }
+  return (r.data.mappings ?? []).filter((m) => m.connection_type === "slack");
+};
+
+const fetchSlackTeamIdForWorkspace = async (workspaceSlug: string): Promise<string | null> => {
+  // Ask Django for any live mapping in this workspace; project_id is
+  // optional on the endpoint. Any mapping carries the workspace's Slack
+  // team_id, which is all we need to open a DM.
+  const r = await callDjango<{ mappings: ProjectMapping[] }>("POST", "/api/v1/silo/project-mappings/", {
+    workspace_slug: workspaceSlug,
+  });
+  if (r.status >= 300) return null;
+  return r.data.mappings?.[0]?.connection_team_id ?? null;
+};
+
+const slackDispatch = async (event: WorkItemEvent, webBaseUrl: string): Promise<void> => {
+  // Slack-side message links MUST use a publicly resolvable URL —
+  // Slack's renderers click them. Caller already passes
+  // PLANE_PUBLIC_URL or fallback.
+  const blocks = buildBlocks(event, webBaseUrl);
+  const fallbackText = `${event.project_identifier}-${event.issue?.sequence_id ?? "?"}: ${event.issue?.name ?? ""}`;
+
+  console.log(
+    `[silo] dispatch event=${event.event_type} ws=${event.workspace_slug} project=${event.project_id} dm_targets=${event.dm_targets.length}`
+  );
+
+  // 1. Channel fan-out for project-bound mappings.
+  const mappings = await fetchSlackChannelMappings(event.workspace_slug, event.project_id);
+  console.log(`[silo] dispatch channel mappings=${mappings.length}`);
+
+  // teamId is needed for DMs too; reuse the mappings' team_id when
+  // present (any mapping carries the workspace's Slack team), but
+  // fall back to looking up workspace-connections via Django if not.
+  let teamId: string | null = mappings[0]?.connection_team_id ?? null;
+
+  // Channel fan-out runs in parallel. Slack's per-bot postMessage rate
+  // limit is 1/sec/channel and ~50/sec total for chat.postMessage —
+  // we'd hit that fanning out to dozens of channels for one event,
+  // not for one event to 2-3 channels. Slack returns 429 with
+  // Retry-After if we ever do; the SDK doesn't auto-retry today
+  // (TODO if/when we have hot channels).
+  const eligibleMappings = mappings.filter(
+    (m) => (m.config?.events ?? []).length === 0 || (m.config?.events ?? []).includes(event.event_type)
+  );
+  // Per-channel try/catch so a network/DNS hiccup on one mapping
+  // doesn't cancel the rest of the fan-out.
+  await Promise.all(
+    eligibleMappings.map(async (m) => {
+      try {
+        const result = await callSlackApiForTeam("chat.postMessage", m.connection_team_id, {
+          channel: m.entity_id,
+          blocks,
+          text: fallbackText,
+          unfurl_links: false,
+          unfurl_media: false,
+        });
+        if (!result || !result.ok) {
+          console.error(`[silo] chat.postMessage to ${m.entity_id} failed: ${result?.error ?? "no-team-context"}`);
+        }
+      } catch (err) {
+        console.error(`[silo] chat.postMessage to ${m.entity_id} threw:`, err);
+      }
+    })
+  );
+
+  // 2. Per-user DMs (assignment / mention).
+  if (event.dm_targets.length > 0 && !teamId) {
+    // No project channel mappings, so we don't have a team_id from
+    // them. Look up the workspace's Slack install location via Django.
+    teamId = await fetchSlackTeamIdForWorkspace(event.workspace_slug);
+  }
+  if (event.dm_targets.length > 0 && teamId) {
+    const dmTeamId = teamId;
+    // DMs run in parallel — one user per request, no shared rate-limit
+    // bucket between users on chat.postMessage.
+    await Promise.all(
+      event.dm_targets.map(async (dm) => {
+        try {
+          console.log(`[silo] DM attempt slack_user=${dm.slack_user_id}`);
+          const opened = await callSlackApiForTeam<{
+            ok: boolean;
+            error?: string;
+            channel?: { id: string };
+          }>("conversations.open", dmTeamId, { users: dm.slack_user_id });
+          if (!opened || !opened.ok || !opened.channel?.id) {
+            console.error(
+              `[silo] conversations.open for ${dm.slack_user_id} failed: ${opened?.error ?? "no-team-context"}`
+            );
+            return;
+          }
+          console.log(`[silo] DM channel opened: ${opened.channel.id}`);
+          const r = await callSlackApiForTeam("chat.postMessage", dmTeamId, {
+            channel: opened.channel.id,
+            blocks,
+            text: fallbackText,
+            unfurl_links: false,
+            unfurl_media: false,
+          });
+          if (!r || !r.ok) {
+            console.error(`[silo] DM postMessage to ${dm.slack_user_id} failed: ${r?.error ?? "no-team-context"}`);
+          } else {
+            console.log(`[silo] DM postMessage to ${dm.slack_user_id} ok`);
+          }
+        } catch (err) {
+          console.error(`[silo] DM to ${dm.slack_user_id} threw:`, err);
+        }
+      })
+    );
+  } else if (event.dm_targets.length > 0) {
+    console.warn(`[silo] dm_targets present but no teamId — skipping DMs`);
+  }
+};
+
+export const slackDispatcher: IntegrationDispatcher = {
+  name: "slack",
+  mappingType: "slack-channel-notification",
+  dispatch: slackDispatch,
+};

@@ -22,7 +22,7 @@ import axios from "axios";
 import type { Request, Response, Router } from "express";
 import express from "express";
 
-import { getSlackConfig } from "../config";
+import { getSlackConfig } from "./config";
 import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
 import { callSlackApiForTeam } from "./api";

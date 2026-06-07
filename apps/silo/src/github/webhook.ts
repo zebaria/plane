@@ -23,7 +23,7 @@
 import type { Request, Response, Router } from "express";
 import express from "express";
 
-import { getGithubConfig } from "../config";
+import { getGithubConfig } from "./config";
 import { handleIssueCommentEvent, type IssueCommentPayload } from "./handlers/issue-comment";
 import { handleIssuesEvent, type IssuesPayload } from "./handlers/issues";
 import {

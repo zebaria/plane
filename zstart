@@ -192,6 +192,21 @@ cmd_up() {
     if [[ -f "$PNPM_PID" ]] && kill -0 "$(cat "$PNPM_PID")" 2>/dev/null; then
       echo "==> pnpm dev already running (pid $(cat "$PNPM_PID")) — skipping"
     else
+      # Preflight: a previous `./zstart stop` can leave a tsdown --watch
+      # zombie bound to a node dev port. If so, the new pnpm dev's child
+      # crashes with EADDRINUSE while turbo keeps the parent alive — so the
+      # PNPM_PID check below passes and we'd report "Up" while a stale,
+      # route-missing build still serves the port (silently dropping new
+      # routes like /silo/api/github-webhook). Detect it and auto-nuke so
+      # the new build gets a clean bind.
+      held=""
+      for port in 3000 3001 3002 3005 4000; do
+        lsof -tiTCP:$port -sTCP:LISTEN >/dev/null 2>&1 && held="$held $port"
+      done
+      if [[ -n "$held" ]]; then
+        echo "==> Stale node dev port(s) held:$held — running nuke before launch"
+        cmd_nuke
+      fi
       echo "==> Starting pnpm dev (logs: $PNPM_LOG)"
       nohup pnpm dev > "$PNPM_LOG" 2>&1 &
       echo $! > "$PNPM_PID"

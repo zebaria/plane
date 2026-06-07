@@ -17,7 +17,7 @@
 
 import axios from "axios";
 
-import { getSlackConfig } from "../config";
+import { getSlackConfig } from "./config";
 import { callDjango } from "../django-client";
 import type { SlackOAuthResponse } from "./oauth";
 import { invalidateTeamContext, resolveTeamContext } from "./team-context";

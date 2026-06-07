@@ -2,111 +2,80 @@
  * Copyright (c) 2026-present Zebaria.
  * SPDX-License-Identifier: AGPL-3.0-only
  *
- * Pulls provider secrets from AWS Secrets Manager at startup. Per
- * the corpinfra convention: dev secrets live in us-east-1 under
- * /dev/<name>; prod under us-west-2 /prod/<name>. Auth uses default
+ * Shared secret-store kit. Provider-agnostic plumbing for reading/writing
+ * secrets from AWS Secrets Manager, used by each integration's own loader
+ * (see slack/secrets.ts, github/secrets.ts). Per the corpinfra convention:
+ * dev secrets live in us-east-1 under /dev/<name>; prod under us-west-2
+ * /prod/<name>; local under /local/<name>. Auth uses the default
  * credential provider chain (ADC locally, task role in prod).
+ *
+ * Integration-specific secret shapes and loaders deliberately do NOT live
+ * here — they belong to the integration that owns them.
  */
 
-import { GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
+import { CreateSecretCommand, GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 
-export type SlackSecrets = {
-  client_id: string;
-  client_secret: string;
-  signing_secret: string;
-};
-
-const envCfg = (env: string): { region: string; prefix: string } => {
+export const secretEnvCfg = (env: string): { region: string; prefix: string } => {
   if (env === "prod") return { region: "us-west-2", prefix: "/prod" };
   if (env === "local") return { region: "us-east-1", prefix: "/local" };
   return { region: "us-east-1", prefix: "/dev" };
 };
 
-const fetchJson = async <T>(name: string, env: string): Promise<T> => {
-  const { region, prefix } = envCfg(env);
+/** Fetch and JSON-parse the secret named `<prefix>/<name>` for this env. */
+export const fetchJson = async <T>(name: string, env: string): Promise<T> => {
+  const { region, prefix } = secretEnvCfg(env);
   const client = new SecretsManagerClient({ region });
   const out = await client.send(new GetSecretValueCommand({ SecretId: `${prefix}/${name}` }));
   if (!out.SecretString) throw new Error(`Empty secret: ${prefix}/${name}`);
   return JSON.parse(out.SecretString) as T;
 };
 
-const required = <K extends string>(obj: Record<string, unknown>, keys: K[], name: string): void => {
-  for (const k of keys) {
-    if (!obj[k]) throw new Error(`Secret ${name} missing key: ${k}`);
-  }
-};
-
-export type GithubAppSecrets = {
-  app_id: string;
-  client_id: string;
-  client_secret: string;
-  webhook_secret: string;
-  private_key: string;
-  app_slug?: string;
-};
-
-export type GithubOAuthSecrets = {
-  client_id: string;
-  client_secret: string;
-};
-
-export const loadGithubAppSecrets = async (env: string): Promise<GithubAppSecrets | null> => {
-  // Returns null when the secret doesn't exist yet — Phase 4a's
-  // manifest flow creates it on first install. Silo must not crash
-  // on startup when GH hasn't been bootstrapped yet.
-  try {
-    const v = await fetchJson<GithubAppSecrets>("plane-github", env);
-    required(
-      v as unknown as Record<string, unknown>,
-      ["app_id", "client_id", "client_secret", "webhook_secret", "private_key"],
-      "plane-github"
-    );
-    return v;
-  } catch (err) {
-    if ((err as { name?: string }).name === "ResourceNotFoundException") return null;
-    throw err;
-  }
-};
-
-export const writeGithubAppSecrets = async (env: string, value: GithubAppSecrets): Promise<void> => {
-  const { region, prefix } = envCfg(env);
+/** Create the secret `<prefix>/<name>` (fails if it already exists). */
+export const createSecret = async (name: string, env: string, value: unknown): Promise<void> => {
+  const { region, prefix } = secretEnvCfg(env);
   const client = new SecretsManagerClient({ region });
-  const SecretId = `${prefix}/plane-github`;
-  // CreateSecret if absent, refuse if present — manifest flow is
-  // one-shot to prevent accidentally overwriting a working install.
-  const { CreateSecretCommand } = await import("@aws-sdk/client-secrets-manager");
-  await client.send(new CreateSecretCommand({ Name: SecretId, SecretString: JSON.stringify(value) }));
+  await client.send(new CreateSecretCommand({ Name: `${prefix}/${name}`, SecretString: JSON.stringify(value) }));
 };
 
-export const loadGithubOAuthSecrets = async (env: string): Promise<GithubOAuthSecrets | null> => {
-  try {
-    const v = await fetchJson<GithubOAuthSecrets>("plane-github-oauth", env);
-    required(v as unknown as Record<string, unknown>, ["client_id", "client_secret"], "plane-github-oauth");
-    return v;
-  } catch (err) {
-    if ((err as { name?: string }).name === "ResourceNotFoundException") return null;
-    throw err;
+// Thrown when a secret loads but is missing required keys. This is an
+// operator misconfiguration of an existing secret — distinct from the
+// secret being unavailable — so it is always fatal (see optionalSecretUnavailable).
+export class SecretShapeError extends Error {}
+
+/** Assert that `obj` has every key in `keys`, else throw SecretShapeError. */
+export const required = <K extends string>(obj: Record<string, unknown>, keys: K[], name: string): void => {
+  for (const k of keys) {
+    if (!obj[k]) throw new SecretShapeError(`Secret ${name} missing key: ${k}`);
   }
 };
 
-const envCfgExport = envCfg;
-export { envCfgExport as secretEnvCfg };
-
-export const loadSlackSecrets = async (env: string): Promise<SlackSecrets> => {
-  // Local-dev fallback: if all three Slack env vars are present, skip
-  // Secrets Manager entirely. Avoids the dev-loop crashing when the
-  // workstation has no AWS creds for the silo IAM role's namespace.
-  const envClientId = process.env.SLACK_CLIENT_ID;
-  const envClientSecret = process.env.SLACK_CLIENT_SECRET;
-  const envSigningSecret = process.env.SLACK_SIGNING_SECRET;
-  if (envClientId && envClientSecret && envSigningSecret) {
-    return {
-      client_id: envClientId,
-      client_secret: envClientSecret,
-      signing_secret: envSigningSecret,
-    };
-  }
-  const v = await fetchJson<SlackSecrets>("plane-slack", env);
-  required(v as unknown as Record<string, unknown>, ["client_id", "client_secret", "signing_secret"], "plane-slack");
-  return v;
+/**
+ * Decide how to handle a failure while loading an *optional* integration
+ * secret. Backend-agnostic on purpose: we don't match AWS-specific error
+ * names, because the secret store may be Secrets Manager, Vault, env
+ * vars, etc. depending on the install.
+ *
+ * Rule:
+ *   - A SecretShapeError (secret exists but is missing required keys) is
+ *     a genuine misconfiguration → rethrow (fatal).
+ *   - Any other failure — not found, access denied, store unreachable —
+ *     means the integration simply isn't usable here. Disable it so the
+ *     service still boots, but log a LOUD warning so the cause is visible
+ *     instead of silently swallowed. Installers routinely forget to
+ *     create the secret or grant read access; that should degrade one
+ *     integration, not crash-loop the whole silo.
+ *
+ * Returns true if the caller should treat the secret as absent (null);
+ * rethrows the SecretShapeError otherwise.
+ */
+export const optionalSecretUnavailable = (err: unknown, secretName: string): boolean => {
+  if (err instanceof SecretShapeError) throw err;
+  const reason = (err as { name?: string }).name ?? (err as Error).message ?? "unknown error";
+  console.error(
+    `[silo] WARNING: could not load optional secret "${secretName}" (${reason}). ` +
+      `Treating this integration as DISABLED so the service can start. ` +
+      `If you intend it to work, ensure the secret exists and the silo has ` +
+      `read access to it, then restart.`
+  );
+  return true;
 };

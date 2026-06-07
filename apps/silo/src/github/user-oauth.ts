@@ -21,7 +21,8 @@ import axios from "axios";
 import type { Request, Response, Router } from "express";
 import express from "express";
 
-import { config, getGithubConfig } from "../config";
+import { config } from "../config";
+import { getGithubConfig, githubGhesAllowedHosts } from "./config";
 import { callDjango } from "../django-client";
 import { asyncHandler } from "../express-async";
 import { apiBaseFor, oauthAccessTokenUrlFor, oauthAuthorizeUrlFor, validateGhesOrigin } from "./host";
@@ -139,7 +140,7 @@ export const githubUserOAuthRouter = (): Router => {
     // GHES origin (e.g. "https://ghe.acme.com"). Empty/absent → cloud.
     // SSRF-guarded: this origin later receives the OAuth code exchange
     // and /user reads, so it must be on the operator allowlist.
-    const ghesCheck = validateGhesOrigin(req.query.ghesBaseUrl as string | undefined, config.githubGhesAllowedHosts);
+    const ghesCheck = validateGhesOrigin(req.query.ghesBaseUrl as string | undefined, githubGhesAllowedHosts);
     if (!ghesCheck.ok) {
       res.status(400).json({ error: ghesCheck.error });
       return;
