@@ -7,8 +7,8 @@
  *
  *   GET  /silo/api/github/manifest?env=local|dev|prod
  *        -> renders a self-posting form to GitHub's manifest endpoint
- *           for the zebaria org. Uses the env-specific manifest JSON
- *           baked in at build time.
+ *           for the zebaria org. The manifest is built in code from
+ *           silo's runtime config (see buildManifest).
  *   POST /silo/api/github/manifest/callback?code=...
  *        -> exchanges the manifest code for App credentials, writes
  *           /<env>/plane-github in Secrets Manager. One-shot.
@@ -19,9 +19,6 @@
  *        -> validates state, fetches installation metadata, posts
  *           to Django HMAC install endpoint.
  */
-
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 
 import type { Request, Response, Router } from "express";
 import express from "express";
@@ -68,12 +65,33 @@ const consumeInstallState = (token: string): StateEntry | null => {
   return entry;
 };
 
-const loadManifest = (env: string): Record<string, unknown> => {
-  // Manifests live next to the silo source. tsdown copies them into
-  // dist/ at build time; in dev we resolve relative to cwd of the
-  // running process (apps/silo).
-  const file = join(process.cwd(), `github-app-manifest-${env}.json`);
-  return JSON.parse(readFileSync(file, "utf8"));
+// The GitHub App manifest is fully derived from silo's own runtime
+// config — every URL is `${publicBaseUrl}${basePath}/api/github/...`
+// and the rest is static. We build it in code rather than shipping
+// per-env JSON files so the container stays generic: the only per-env
+// input is SILO_PUBLIC_BASE_URL, injected at deploy time. (The old
+// JSON files baked a developer's personal tunnel host into the image
+// and were never copied into the runtime layer anyway.)
+const buildManifest = (env: string): Record<string, unknown> => {
+  const ghBase = `${config.publicBaseUrl}${config.basePath}/api/github`;
+  return {
+    name: `Plane - Zebaria (${env})`,
+    url: config.publicBaseUrl,
+    hook_attributes: { url: `${ghBase}-webhook`, active: true },
+    redirect_url: `${ghBase}/manifest/callback`,
+    callback_urls: [`${ghBase}/team/auth/callback`, `${ghBase}/auth/user/callback`],
+    setup_url: `${ghBase}/team/auth/callback`,
+    setup_on_update: true,
+    public: false,
+    default_permissions: {
+      issues: "write",
+      pull_requests: "read",
+      metadata: "read",
+      members: "read",
+      contents: "read",
+    },
+    default_events: ["issues", "issue_comment", "pull_request", "pull_request_review", "label", "repository"],
+  };
 };
 
 // Encode (env, ghesHost) into the manifest state. GitHub round-trips
@@ -96,7 +114,7 @@ const htmlEscape = (s: string): string =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
 const renderManifestForm = (env: string, org: string, ghesHost?: string): string => {
-  const manifest = loadManifest(env);
+  const manifest = buildManifest(env);
   const target = manifestUrlFor(org, ghesHost);
   const stateValue = encodeManifestState(env, ghesHost);
   const envH = htmlEscape(env);
