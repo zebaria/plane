@@ -9,7 +9,7 @@ import helmet from "helmet";
 
 import { config } from "./config";
 import { callDjango } from "./django-client";
-import { mountIntegrations } from "./integrations";
+import { bootstrapIntegrations, mountIntegrations } from "./integrations";
 import { notificationsRouter } from "./notifications";
 
 export function createApp(configuredIntegrations: Set<string> = new Set()): Express {
@@ -64,6 +64,12 @@ export function createApp(configuredIntegrations: Set<string> = new Set()): Expr
   // Notifications (outbound dispatch) is always available — it gates per
   // event on live mapping types, not on a single provider being set up.
   router.use(notificationsRouter());
+
+  // Bootstrap routes mount UNCONDITIONALLY — they're the cold-start
+  // paths (e.g. GitHub's App-manifest flow) that create the secret an
+  // integration's load()/mount() gate on. Gating these on "configured"
+  // would deadlock: you could never set up an unconfigured integration.
+  bootstrapIntegrations(router);
 
   // Each integration mounts its own routes, but only if it loaded
   // successfully at startup. An unconfigured integration's endpoints

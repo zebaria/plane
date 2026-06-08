@@ -139,7 +139,14 @@ into the org and pick repos.</p>
 </body></html>`;
 };
 
-export const githubOAuthRouter = (): Router => {
+// Bootstrap routes create the GitHub App and write /<env>/plane-github.
+// They must mount UNCONDITIONALLY — before any secret exists — because
+// they're the cold-start path: without them there's no way to create
+// the secret that everything else is gated on. Wired via the
+// integration registry's bootstrap() hook (see integrations.ts), which
+// runs for every integration regardless of whether load() succeeded.
+// The credential-using routes (githubOAuthRouter) stay behind mount().
+export const githubBootstrapRouter = (): Router => {
   const r = express.Router();
 
   r.get("/api/github/manifest", (req: Request, res: Response) => {
@@ -249,6 +256,12 @@ zebaria org and choose repos.</p>
       );
     })
   );
+
+  return r;
+};
+
+export const githubOAuthRouter = (): Router => {
+  const r = express.Router();
 
   r.get("/api/github/team/auth/url", (req: Request, res: Response) => {
     const workspaceSlug = String(req.query.workspaceSlug ?? "").trim();

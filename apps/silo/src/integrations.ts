@@ -32,6 +32,15 @@ export type Integration = {
    * only for a genuine misconfiguration that should halt startup.
    */
   load: (env: string) => Promise<boolean>;
+  /**
+   * Mount routes that must exist BEFORE the integration is configured —
+   * i.e. the cold-start/bootstrap path that creates the secret `load()`
+   * looks for. Called unconditionally, regardless of whether `load()`
+   * returned true, so an unconfigured integration can still be set up
+   * (e.g. GitHub's App-manifest flow). Optional — an integration with no
+   * bootstrap step omits it.
+   */
+  bootstrap?: (router: Router) => void;
   /** Mount the integration's inbound routes onto the shared router. */
   mount: (router: Router) => void;
   /**
@@ -62,6 +71,19 @@ export const loadIntegrations = async (env: string): Promise<Set<string>> => {
     })
   );
   return configured;
+};
+
+/**
+ * Mount every integration's bootstrap routes, UNCONDITIONALLY. These are
+ * the cold-start paths (e.g. GitHub's App-manifest flow) that create the
+ * secret `load()` looks for, so they cannot be gated on being configured
+ * — that would be a chicken-and-egg deadlock. Safe to call before
+ * loadIntegrations(); independent of the configured set.
+ */
+export const bootstrapIntegrations = (router: Router): void => {
+  for (const i of INTEGRATIONS) {
+    if (i.bootstrap) i.bootstrap(router);
+  }
 };
 
 /** Mount the routes of every configured integration. */

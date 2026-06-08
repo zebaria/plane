@@ -11,7 +11,7 @@ import type { Router } from "express";
 import { isGithubConfigured, setGithubConfig } from "./config";
 import type { Integration } from "../integrations";
 import { loadGithubAppSecrets, loadGithubOAuthSecrets } from "./secrets";
-import { githubOAuthRouter } from "./oauth";
+import { githubBootstrapRouter, githubOAuthRouter } from "./oauth";
 import { githubOutboundDispatcher } from "./outbound";
 import { githubReposRouter } from "./repos";
 import { githubUserOAuthRouter } from "./user-oauth";
@@ -46,6 +46,14 @@ export const githubIntegration: Integration = {
     });
     console.log(`[silo] GitHub integration enabled (/${env}/plane-github)`);
     return true;
+  },
+
+  // The App-manifest bootstrap routes mount unconditionally — they
+  // create the /<env>/plane-github secret that load()/mount() gate on,
+  // so they must exist before the integration is configured. See
+  // ../integrations.ts bootstrapIntegrations().
+  bootstrap: (router: Router): void => {
+    router.use(githubBootstrapRouter());
   },
 
   mount: (router: Router): void => {
