@@ -276,7 +276,11 @@ export const githubBootstrapRouter = (): Router => {
         throw err;
       }
       // Hot-load the new config if it's the current env, so the next
-      // /team/auth/url call works without a restart.
+      // /team/auth/url call works without a restart. OAuth creds default
+      // to the App's own client_id/secret (a GitHub App does user OAuth
+      // with its own credentials — no separate OAuth app), overridden only
+      // if a distinct /<env>/plane-github-oauth secret exists. Must match
+      // the same defaulting in github/index.ts load().
       if (env === config.env) {
         const oauth = await loadGithubOAuthSecrets(config.env);
         setGithubConfig({
@@ -286,8 +290,8 @@ export const githubBootstrapRouter = (): Router => {
           clientSecret: secrets.client_secret,
           webhookSecret: secrets.webhook_secret,
           privateKey: secrets.private_key,
-          oauthClientId: oauth?.client_id ?? "",
-          oauthClientSecret: oauth?.client_secret ?? "",
+          oauthClientId: oauth?.client_id ?? secrets.client_id,
+          oauthClientSecret: oauth?.client_secret ?? secrets.client_secret,
         });
       }
       // One-press path: if Connect threaded a workspace through the

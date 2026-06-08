@@ -37,6 +37,13 @@ export const githubIntegration: Integration = {
       );
       return true;
     }
+    // A GitHub App does user-to-server OAuth with its OWN client_id/secret
+    // (the ones the manifest flow already stored in /<env>/plane-github) —
+    // there is no separate OAuth app or second credential. So default the
+    // OAuth creds to the App's own, and only override if a distinct
+    // /<env>/plane-github-oauth secret exists (legacy/optional escape hatch
+    // for pointing user-OAuth at a different client). Without this default,
+    // per-user OAuth 503s on any env bootstrapped purely via the manifest.
     const ghOauth = await loadGithubOAuthSecrets(env);
     setGithubConfig({
       appId: gh.app_id,
@@ -45,8 +52,8 @@ export const githubIntegration: Integration = {
       clientSecret: gh.client_secret,
       webhookSecret: gh.webhook_secret,
       privateKey: gh.private_key,
-      oauthClientId: ghOauth?.client_id ?? "",
-      oauthClientSecret: ghOauth?.client_secret ?? "",
+      oauthClientId: ghOauth?.client_id ?? gh.client_id,
+      oauthClientSecret: ghOauth?.client_secret ?? gh.client_secret,
     });
     console.log(`[silo] GitHub integration enabled (/${env}/plane-github)`);
     return true;
