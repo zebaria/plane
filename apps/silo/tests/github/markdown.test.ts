@@ -14,7 +14,7 @@
 import { marked } from "marked";
 import { describe, expect, it } from "vitest";
 
-import { convertTaskLists } from "../../src/github/markdown";
+import { convertTaskLists } from "@/github/markdown";
 
 describe("convertTaskLists", () => {
   it("returns the input unchanged when there's no checkbox", () => {

@@ -22,8 +22,8 @@ vi.mock("../../src/django-client", () => ({
   callDjango: vi.fn().mockResolvedValue({ status: 200, data: {} }),
 }));
 
-import { callGithub } from "../../src/github/api";
-import { handleInstallationEvent, handleInstallationRepositoriesEvent } from "../../src/github/handlers/lifecycle";
+import { callGithub } from "@/github/api";
+import { handleInstallationEvent, handleInstallationRepositoriesEvent } from "@/github/handlers/lifecycle";
 
 const mockedCallGh = callGithub as unknown as ReturnType<typeof vi.fn>;
 

@@ -11,14 +11,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { RepoBinding } from "../../src/github/django";
+import type { RepoBinding } from "@/github/django";
 import {
   ghStateForPlaneState,
   htmlToMarkdown,
   isBidirectional,
   passesOutboundGate,
   rewriteMentionsForGithub,
-} from "../../src/github/outbound";
+} from "@/github/outbound";
 
 const baseBinding: RepoBinding = {
   id: "b1",
@@ -51,7 +51,7 @@ describe("htmlToMarkdown", () => {
     expect(md).toMatch(/^-\s+b/m);
   });
 
-  it("converts <strong> and <em> to markdown emphasis", () => {
+  it("converts <strong> and <em> to Markdown emphasis", () => {
     expect(htmlToMarkdown("<p><strong>bold</strong></p>")).toContain("**bold**");
     expect(htmlToMarkdown("<p><em>italic</em></p>")).toContain("_italic_");
   });

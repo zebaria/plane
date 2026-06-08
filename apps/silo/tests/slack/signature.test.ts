@@ -10,7 +10,7 @@ import { createHmac } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import { verifySlackSignature } from "../../src/slack/signature";
+import { verifySlackSignature } from "@/slack/signature";
 
 const SECRET = "test-signing-secret";
 

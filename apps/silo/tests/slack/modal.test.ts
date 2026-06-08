@@ -10,8 +10,8 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CREATE_WORK_ITEM_CALLBACK, PROJECT_SELECT_ACTION, buildCreateWorkItemView } from "../../src/slack/modal";
-import type { ProjectMetadata } from "../../src/slack/project-metadata";
+import { CREATE_WORK_ITEM_CALLBACK, PROJECT_SELECT_ACTION, buildCreateWorkItemView } from "@/slack/modal";
+import type { ProjectMetadata } from "@/slack/project-metadata";
 
 const meta = {
   workspaceSlug: "wz",
@@ -53,6 +53,7 @@ const fullMeta: ProjectMetadata = {
     { key: "low", label: "Low" },
     { key: "none", label: "None" },
   ],
+  intakeEnabled: false,
 };
 
 type Block = Record<string, unknown>;
@@ -212,7 +213,7 @@ describe("buildCreateWorkItemView", () => {
       expect(findBlock(view, "labels")).toBeUndefined();
       expect(findBlock(view, "assignees")).toBeUndefined();
       expect(findBlock(view, "type")).toBeUndefined();
-      // priority is static so it still renders
+      // priority is static, so it still renders
       expect(findBlock(view, "priority")).toBeDefined();
     });
 

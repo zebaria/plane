@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { decodeManifestState, encodeManifestState } from "../../src/github/oauth";
+import { decodeManifestState, encodeManifestState } from "@/github/oauth";
 
 describe("decodeManifestState", () => {
   it("reads a bare env as cloud (no ghesBaseUrl/workspace)", () => {

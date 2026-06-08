@@ -31,9 +31,9 @@ vi.mock("../../src/django-client", () => ({
   callDjango: vi.fn().mockResolvedValue({ status: 404, data: {} }),
 }));
 
-import { fetchRepoBindings } from "../../src/github/django";
-import { handleIssueCommentEvent } from "../../src/github/handlers/issue-comment";
-import { handleIssuesEvent } from "../../src/github/handlers/issues";
+import { fetchRepoBindings } from "@/github/django";
+import { handleIssueCommentEvent } from "@/github/handlers/issue-comment";
+import { handleIssuesEvent } from "@/github/handlers/issues";
 
 const mocked = fetchRepoBindings as unknown as ReturnType<typeof vi.fn>;
 

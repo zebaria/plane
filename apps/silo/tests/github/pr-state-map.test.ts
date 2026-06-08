@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { prStateKeyForPullRequest, prStateKeyForReview } from "../../src/github/handlers/pull-request";
+import { prStateKeyForPullRequest, prStateKeyForReview } from "@/github/handlers/pull-request";
 
 const basePr = {
   id: 1,

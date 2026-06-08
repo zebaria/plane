@@ -18,7 +18,7 @@ import {
   oauthAuthorizeUrlFor,
   validateGhesOrigin,
   webBaseFor,
-} from "../../src/github/host";
+} from "@/github/host";
 
 describe("apiBaseFor", () => {
   it("returns cloud base when ghesBaseUrl is undefined", () => {
