@@ -8,7 +8,7 @@
 
 import type { Router } from "express";
 
-import { isGithubConfigured, setGithubConfig } from "./config";
+import { setGithubConfig } from "./config";
 import type { Integration } from "../integrations";
 import { loadGithubAppSecrets, loadGithubOAuthSecrets } from "./secrets";
 import { githubBootstrapRouter, githubOAuthRouter } from "./oauth";
@@ -24,14 +24,18 @@ export const githubIntegration: Integration = {
   load: async (env: string): Promise<boolean> => {
     // The GitHub App secret may not exist yet on a fresh deploy — the
     // manifest flow creates it. OAuth creds are a separate, also-optional
-    // secret. Without the App secret the integration stays disabled.
+    // secret. Unlike a normal integration, GitHub always returns true so
+    // mount() is always called: its routes self-bootstrap (team/auth/url
+    // redirects an admin into the create-App flow when no secret exists)
+    // and degrade gracefully via isGithubConfigured() checks. Returning
+    // false here would 404 the very route a user clicks to set it up.
     const gh = await loadGithubAppSecrets(env);
     if (!gh) {
       console.log(
-        `[silo] GitHub integration disabled (no secret at /${env}/plane-github yet — ` +
-          `run the manifest flow at /silo/api/github/manifest?env=${env} to bootstrap)`
+        `[silo] GitHub integration unconfigured (no secret at /${env}/plane-github yet) — ` +
+          `routes mounted; Connect will redirect into the manifest bootstrap`
       );
-      return false;
+      return true;
     }
     const ghOauth = await loadGithubOAuthSecrets(env);
     setGithubConfig({
@@ -56,8 +60,15 @@ export const githubIntegration: Integration = {
     router.use(githubBootstrapRouter());
   },
 
+  // Mounted unconditionally — NOT gated on isGithubConfigured(). Two
+  // reasons: (1) team/auth/url self-bootstraps when no App exists yet
+  // (returns the manifest URL so Connect redirects the admin into the
+  // create-App flow instead of 404ing); (2) the manifest callback
+  // hot-loads config after writing the secret, but gating mount() at
+  // startup would leave these routes 404 until a restart. Each handler
+  // checks isGithubConfigured()/getGithubConfig() itself and degrades
+  // gracefully when unconfigured.
   mount: (router: Router): void => {
-    if (!isGithubConfigured()) return;
     router.use(githubOAuthRouter());
     router.use(githubUserOAuthRouter());
     router.use(githubReposRouter());

@@ -94,15 +94,44 @@ const buildManifest = (env: string): Record<string, unknown> => {
   };
 };
 
-// Encode (env, ghesHost) into the manifest state. GitHub round-trips
-// it unchanged in the redirect, so we read it back in the callback.
-// Exported for unit testing the round-trip.
-export const encodeManifestState = (env: string, ghesHost?: string): string =>
-  ghesHost ? `${env}|${encodeURIComponent(ghesHost)}` : env;
+// Encode the manifest state. GitHub round-trips it unchanged through
+// both the App-creation redirect and the subsequent install redirect,
+// so we read it back in the callbacks. It carries env (which env we're
+// bootstrapping) + optional GHES origin + optional workspace context
+// (ws/uid). The workspace context lets a single "Connect" press flow
+// all the way to a completed connection: it's threaded through App
+// creation → install → team/auth/callback without the user re-entering
+// it. base64url-JSON so it survives GitHub's opaque state round-trip
+// regardless of which optional fields are present.
+export type ManifestState = {
+  env: string;
+  ghesBaseUrl?: string;
+  workspaceSlug?: string;
+  userId?: string;
+};
 
-export const decodeManifestState = (raw: string): { env: string; ghesBaseUrl?: string } => {
-  const [env, encHost] = raw.split("|", 2);
-  return { env, ghesBaseUrl: encHost ? decodeURIComponent(encHost) : undefined };
+export const encodeManifestState = (env: string, opts?: Omit<ManifestState, "env">): string => {
+  const payload: ManifestState = { env };
+  if (opts?.ghesBaseUrl) payload.ghesBaseUrl = opts.ghesBaseUrl;
+  if (opts?.workspaceSlug) payload.workspaceSlug = opts.workspaceSlug;
+  if (opts?.userId) payload.userId = opts.userId;
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+};
+
+export const decodeManifestState = (raw: string): ManifestState => {
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<ManifestState>;
+    if (!parsed || typeof parsed.env !== "string") return { env: "" };
+    return {
+      env: parsed.env,
+      ghesBaseUrl: typeof parsed.ghesBaseUrl === "string" ? parsed.ghesBaseUrl : undefined,
+      workspaceSlug: typeof parsed.workspaceSlug === "string" ? parsed.workspaceSlug : undefined,
+      userId: typeof parsed.userId === "string" ? parsed.userId : undefined,
+    };
+  } catch {
+    // Malformed/garbage state — treat as no env so the caller rejects it.
+    return { env: "" };
+  }
 };
 
 // Escape values reflected into the bootstrap HTML. `org` is free-form
@@ -113,29 +142,38 @@ export const decodeManifestState = (raw: string): { env: string; ghesBaseUrl?: s
 const htmlEscape = (s: string): string =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 
-const renderManifestForm = (env: string, org: string, ghesHost?: string): string => {
+const renderManifestForm = (
+  env: string,
+  org: string,
+  nonce: string,
+  ghesHost?: string,
+  ws?: { workspaceSlug?: string; userId?: string }
+): string => {
   const manifest = buildManifest(env);
   const target = manifestUrlFor(org, ghesHost);
-  const stateValue = encodeManifestState(env, ghesHost);
+  const stateValue = encodeManifestState(env, {
+    ghesBaseUrl: ghesHost,
+    workspaceSlug: ws?.workspaceSlug,
+    userId: ws?.userId,
+  });
   const envH = htmlEscape(env);
   const orgH = htmlEscape(org);
   const whereH = ghesHost ? ` (GHES at ${htmlEscape(ghesHost)})` : "";
-  // `target` is built from webBaseFor() (cloud constant or the
-  // allowlist-validated GHES origin) + an encodeURIComponent'd org, so
-  // it's already a safe URL; stateValue is URL-encoded for the query.
+  // The form auto-submits so the only clicks the user ever sees are
+  // GitHub's own mandatory "Create app" and "Install" approvals — this
+  // shim page is collapsed away. The submit button remains as a no-JS
+  // fallback. The inline script carries the CSP nonce set by the route;
+  // `manifest` and `target` are escaped/built safely above.
   return `<!doctype html><html><head><meta charset="utf-8"><title>Plane GitHub App bootstrap (${envH}${whereH})</title></head>
 <body>
-<h1>Create GitHub App for env=${envH}${whereH}</h1>
-<p>Click the button to register a new GitHub App against the
-<code>${orgH}</code> org. After GitHub creates it you'll be redirected
-back to silo, which will store the App credentials in AWS Secrets
-Manager at <code>/${envH}/plane-github</code>. Then click
-<strong>Install App</strong> on the new App's page to install it
-into the org and pick repos.</p>
-<form method="post" action="${htmlEscape(target)}?state=${encodeURIComponent(stateValue)}">
+<h1>Creating GitHub App for env=${envH}${whereH}…</h1>
+<p>Registering a new GitHub App against the <code>${orgH}</code> org and
+redirecting you to GitHub. If nothing happens, click the button.</p>
+<form id="manifest-form" method="post" action="${htmlEscape(target)}?state=${encodeURIComponent(stateValue)}">
   <input type="hidden" name="manifest" value='${JSON.stringify(manifest).replace(/'/g, "&#39;")}'>
   <button type="submit">Create GitHub App for ${envH}${whereH}</button>
 </form>
+<script nonce="${nonce}">document.getElementById('manifest-form').submit();</script>
 </body></html>`;
 };
 
@@ -167,9 +205,21 @@ export const githubBootstrapRouter = (): Router => {
     }
     const ghesHost = ghesCheck.origin;
     const org = String(req.query.org ?? "").trim() || "zebaria";
+    // Optional workspace context: when Connect routes a fresh env here,
+    // it passes ws/uid so the flow can auto-complete the connection
+    // after install instead of making the admin click Connect again.
+    const workspaceSlug = String(req.query.workspaceSlug ?? "").trim() || undefined;
+    const userId = String(req.query.userId ?? "").trim() || undefined;
     const formAction = webBaseFor(ghesHost);
-    res.setHeader("Content-Security-Policy", `default-src 'self'; form-action ${formAction}`);
-    res.type("html").send(renderManifestForm(env, org, ghesHost));
+    // Per-response nonce so the auto-submit inline <script> is allowed
+    // without opening up 'unsafe-inline'. newCsrfState() is a CSPRNG
+    // token — fine as a one-shot nonce.
+    const nonce = newCsrfState();
+    res.setHeader(
+      "Content-Security-Policy",
+      `default-src 'self'; script-src 'nonce-${nonce}'; form-action ${formAction}`
+    );
+    res.type("html").send(renderManifestForm(env, org, nonce, ghesHost, { workspaceSlug, userId }));
   });
 
   r.get(
@@ -180,7 +230,7 @@ export const githubBootstrapRouter = (): Router => {
       // identify which env we're bootstrapping (set in the form action
       // above) and, for GHES, where to swap api.github.com.
       const rawState = String(req.query.state ?? "").trim();
-      const { env, ghesBaseUrl } = decodeManifestState(rawState);
+      const { env, ghesBaseUrl, workspaceSlug, userId } = decodeManifestState(rawState);
       if (!code || !["local", "dev", "prod"].includes(env)) {
         res.status(400).type("text/plain").send("missing code or invalid state");
         return;
@@ -240,10 +290,24 @@ export const githubBootstrapRouter = (): Router => {
           oauthClientSecret: oauth?.client_secret ?? "",
         });
       }
-      // `conv.html_url` comes from the manifest-conversion response of a
-      // user-influenced host (GHES), so escape it before reflecting it
-      // into HTML (CodeQL js/reflected-xss). `env` is fixed-set but
-      // escaped for uniformity.
+      // One-press path: if Connect threaded a workspace through the
+      // state, send the admin straight into GitHub's "Install App" page
+      // with an install state. After they pick repos, GitHub redirects
+      // to the App's setup_url (= team/auth/callback), which consumes
+      // that state and completes the workspace connection — no second
+      // Connect press. Only available for the running env (the install
+      // state + hot-loaded config are this process's).
+      if (workspaceSlug && userId && env === config.env) {
+        const installState = issueInstallState(workspaceSlug, userId, ghesCheck.origin);
+        const installUrl = `${installNewUrlFor(conv.slug, ghesCheck.origin)}?state=${installState}`;
+        res.redirect(installUrl);
+        return;
+      }
+      // Manual path (no workspace context, or bootstrapping a non-running
+      // env): show the install link. `conv.html_url` comes from the
+      // manifest-conversion response of a user-influenced host (GHES), so
+      // escape it before reflecting it into HTML (CodeQL
+      // js/reflected-xss). `env` is fixed-set but escaped for uniformity.
       const envH = htmlEscape(env);
       const htmlUrlH = htmlEscape(conv.html_url ?? "");
       res.type("html").send(
@@ -279,11 +343,23 @@ export const githubOAuthRouter = (): Router => {
       return;
     }
     const ghesBaseUrl = ghesCheck.origin;
-    const cfg = getGithubConfig();
-    if (!cfg.appSlug) {
-      res.status(503).json({ error: "github app not configured (missing app_slug)" });
+    // Self-bootstrap: if no GitHub App exists for this env yet, there's
+    // no install URL to hand back. Rather than 404/503 (which surfaces
+    // as a silent "connect failed"), return the manifest bootstrap URL
+    // so the UI sends the admin into the create-App flow. From the
+    // user's seat, clicking Connect on a fresh env just starts setup.
+    // (GitHub requires a human to click "Create app" — a manifest can't
+    // mint an App headlessly — so this is as automatic as GitHub allows.)
+    if (!isGithubConfigured() || !getGithubConfig().appSlug) {
+      const params = new URLSearchParams({ env: config.env, workspaceSlug, userId });
+      if (ghesBaseUrl) params.set("ghes_host", ghesBaseUrl);
+      res.json({
+        url: `${config.publicBaseUrl}${config.basePath}/api/github/manifest?${params.toString()}`,
+        bootstrap: true,
+      });
       return;
     }
+    const cfg = getGithubConfig();
     const state = issueInstallState(workspaceSlug, userId, ghesBaseUrl);
     const url = `${installNewUrlFor(cfg.appSlug, ghesBaseUrl)}?state=${state}`;
     res.json({ url });

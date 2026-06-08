@@ -13,27 +13,19 @@ import { describe, expect, it } from "vitest";
 
 import { decodeManifestState, encodeManifestState } from "../../src/github/oauth";
 
-describe("encodeManifestState", () => {
-  it("returns the bare env for a cloud install (no host)", () => {
-    expect(encodeManifestState("prod")).toBe("prod");
-    expect(encodeManifestState("dev", undefined)).toBe("dev");
-  });
-
-  it("joins env and percent-encoded host with a pipe for GHES", () => {
-    expect(encodeManifestState("prod", "https://ghe.acme.com")).toBe("prod|https%3A%2F%2Fghe.acme.com");
-  });
-});
-
 describe("decodeManifestState", () => {
-  it("reads a bare env as cloud (no ghesBaseUrl)", () => {
-    expect(decodeManifestState("prod")).toEqual({ env: "prod", ghesBaseUrl: undefined });
+  it("reads a bare env as cloud (no ghesBaseUrl/workspace)", () => {
+    expect(decodeManifestState(encodeManifestState("prod"))).toEqual({
+      env: "prod",
+      ghesBaseUrl: undefined,
+      workspaceSlug: undefined,
+      userId: undefined,
+    });
   });
 
-  it("splits env and decodes the host for GHES", () => {
-    expect(decodeManifestState("dev|https%3A%2F%2Fghe.acme.com")).toEqual({
-      env: "dev",
-      ghesBaseUrl: "https://ghe.acme.com",
-    });
+  it("returns an empty env for malformed/garbage state", () => {
+    expect(decodeManifestState("not-base64url-json!!!").env).toBe("");
+    expect(decodeManifestState("").env).toBe("");
   });
 });
 
@@ -42,24 +34,42 @@ describe("manifest state round-trip", () => {
     expect(decodeManifestState(encodeManifestState("local"))).toEqual({
       env: "local",
       ghesBaseUrl: undefined,
+      workspaceSlug: undefined,
+      userId: undefined,
     });
   });
 
   it("survives encode → decode for GHES, including a port and trailing path", () => {
     const host = "https://ghe.acme.com:8443";
-    expect(decodeManifestState(encodeManifestState("prod", host))).toEqual({
+    expect(decodeManifestState(encodeManifestState("prod", { ghesBaseUrl: host }))).toEqual({
       env: "prod",
       ghesBaseUrl: host,
+      workspaceSlug: undefined,
+      userId: undefined,
     });
   });
 
-  it("preserves a host with characters that need encoding", () => {
-    // A subpath or query in the host would otherwise collide with the
-    // `|` delimiter or GitHub's own state handling.
+  it("preserves a host with characters that previously collided with the delimiter", () => {
     const host = "https://ghe.acme.com/path?a=b";
-    expect(decodeManifestState(encodeManifestState("dev", host))).toEqual({
+    expect(decodeManifestState(encodeManifestState("dev", { ghesBaseUrl: host }))).toEqual({
       env: "dev",
       ghesBaseUrl: host,
+      workspaceSlug: undefined,
+      userId: undefined,
+    });
+  });
+
+  it("carries workspace context (one-press connect) through the round-trip", () => {
+    const state = encodeManifestState("dev", {
+      ghesBaseUrl: "https://ghe.acme.com",
+      workspaceSlug: "my-workspace",
+      userId: "user-123",
+    });
+    expect(decodeManifestState(state)).toEqual({
+      env: "dev",
+      ghesBaseUrl: "https://ghe.acme.com",
+      workspaceSlug: "my-workspace",
+      userId: "user-123",
     });
   });
 });
