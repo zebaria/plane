@@ -37,6 +37,7 @@ const WorkspaceManagementPage = observer(function WorkspaceManagementPage(_props
   } = useWorkspace();
   // derived values
   const disableWorkspaceCreation = formattedConfig?.DISABLE_WORKSPACE_CREATION ?? "";
+  const enableAllAttachmentTypes = formattedConfig?.ENABLE_ALL_ATTACHMENT_TYPES ?? "";
   const hasNextPage = paginationInfo?.next_page_results && paginationInfo?.next_cursor !== undefined;
 
   // fetch data
@@ -67,6 +68,7 @@ const WorkspaceManagementPage = observer(function WorkspaceManagementPage(_props
     await updateConfigPromise
       .then(() => {
         setIsSubmitting(false);
+        return;
       })
       .catch((err) => {
         console.error(err);
@@ -114,6 +116,35 @@ const WorkspaceManagementPage = observer(function WorkspaceManagementPage(_props
             <Loader.Item height="50px" width="100%" />
           </Loader>
         )}
+        {formattedConfig ? (
+          <div className={cn("flex w-full items-center gap-14 rounded-sm")}>
+            <div className="flex grow items-center gap-4">
+              <div className="grow">
+                <div className="pb-1 text-16 font-medium">Allow all attachment file types.</div>
+                <div className={cn("text-11 leading-5 font-regular text-tertiary")}>
+                  Toggling this on lets members upload attachments of any file type instead of the built-in allowed
+                  list. Script-capable files (HTML, SVG, JS) are always force-downloaded rather than shown inline.
+                </div>
+              </div>
+            </div>
+            <div className={`shrink-0 pr-4 ${isSubmitting && "opacity-70"}`}>
+              <div className="flex items-center gap-4">
+                <ToggleSwitch
+                  value={Boolean(parseInt(enableAllAttachmentTypes))}
+                  onChange={() => {
+                    if (Boolean(parseInt(enableAllAttachmentTypes)) === true) {
+                      updateConfig("ENABLE_ALL_ATTACHMENT_TYPES", "0");
+                    } else {
+                      updateConfig("ENABLE_ALL_ATTACHMENT_TYPES", "1");
+                    }
+                  }}
+                  size="sm"
+                  disabled={isSubmitting}
+                />
+              </div>
+            </div>
+          </div>
+        ) : null}
         {workspaceLoader !== "init-loader" ? (
           <>
             <div className="flex items-center justify-between gap-2 pt-6">

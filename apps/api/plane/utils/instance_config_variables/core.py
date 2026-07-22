@@ -35,6 +35,19 @@ workspace_management_config_variables = [
     },
 ]
 
+attachment_config_variables = [
+    {
+        # When "1", the upload endpoints accept any (non-empty) MIME type instead
+        # of enforcing settings.ATTACHMENT_MIME_TYPES. Script-capable types are
+        # still force-downloaded on serve (settings.SCRIPT_CAPABLE_MIME_TYPES), so
+        # this does not re-open inline stored-XSS.
+        "key": "ENABLE_ALL_ATTACHMENT_TYPES",
+        "value": os.environ.get("ENABLE_ALL_ATTACHMENT_TYPES", "0"),
+        "category": "ATTACHMENT",
+        "is_encrypted": False,
+    },
+]
+
 google_config_variables = [
     {
         "key": "GOOGLE_CLIENT_ID",
@@ -235,6 +248,7 @@ unsplash_config_variables = [
 core_config_variables = [
     *authentication_config_variables,
     *workspace_management_config_variables,
+    *attachment_config_variables,
     *google_config_variables,
     *github_config_variables,
     *gitlab_config_variables,
