@@ -16,7 +16,7 @@ import { SiloSlackCard } from "@/components/integration/silo-slack-card";
 import { IntegrationAndImportExportBanner } from "@/components/ui/integration-and-import-export-banner";
 import { IntegrationsSettingsLoader } from "@/components/ui/loader/settings/integration";
 // constants
-import { APP_INTEGRATIONS } from "@/constants/fetch-keys";
+import { APP_INTEGRATIONS } from "@plane/constants";
 // hooks
 import { useWorkspace } from "@/hooks/store/use-workspace";
 import { useUserPermissions } from "@/hooks/store/user";
