@@ -5,6 +5,7 @@
  */
 
 export * from "./ai";
+export * from "./attachment";
 export * from "./auth";
 export * from "./auth-ee";
 export * from "./base";
