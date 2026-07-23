@@ -1,1 +1,39 @@
+#!/bin/bash
+#
+# Auto-bump the promote version, then run lint-staged.
+#
+# The check-version CI gate fails a preview->master promote PR when
+# preview's package.json version equals master's, and `promote` does not
+# auto-bump. So: on the `preview` branch, if the version still equals
+# master's (i.e. hasn't been bumped since the last promote), bump the
+# patch and stage it so it lands in this commit. Once bumped, later
+# commits in the same cycle see version != master and skip. Result:
+# exactly one bump per promote cycle, with no manual step.
+#
+# Bypass (rare): git commit --no-verify.
+
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ "$branch" = "preview" ]; then
+    pkg="$(git rev-parse --show-toplevel)/package.json"
+    read_ver() { sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
+
+    cur=$(read_ver "$pkg")
+    mas=$(git show origin/master:package.json 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+    if [ -n "$cur" ] && [ "$cur" = "$mas" ]; then
+        case "$cur" in
+            *.*.*)
+                major=${cur%%.*}; rest=${cur#*.}; minor=${rest%%.*}; patch=${rest#*.}
+                if printf '%s' "$patch" | grep -q '^[0-9][0-9]*$'; then
+                    next="$major.$minor.$((patch + 1))"
+                    # Replace only the first "version": "X" occurrence.
+                    perl -i -pe 'if (!$done && s/("version"\s*:\s*")'"$cur"'(")/${1}'"$next"'${2}/) { $done = 1 }' "$pkg"
+                    git add "$pkg"
+                    echo "pre-commit: bumped version $cur -> $next for promote (staged)"
+                fi
+                ;;
+        esac
+    fi
+fi
+
 pnpm lint-staged
