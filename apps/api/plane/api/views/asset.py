@@ -18,7 +18,9 @@ from drf_spectacular.utils import OpenApiExample, OpenApiRequest
 from plane.bgtasks.storage_metadata_task import get_asset_object_metadata
 from plane.settings.storage import S3Storage
 from plane.utils.path_validator import sanitize_filename
+from plane.utils.attachment import is_allowed_attachment_type
 from plane.db.models import FileAsset, User, Workspace
+from plane.app.permissions import WorkspaceUserPermission
 from plane.api.views.base import BaseAPIView
 from plane.api.serializers import (
     UserAssetUploadSerializer,
@@ -404,6 +406,12 @@ class UserServerAssetEndpoint(BaseAPIView):
 class GenericAssetEndpoint(BaseAPIView):
     """This endpoint is used to upload generic assets that can be later bound to entities."""
 
+    # The workspace is taken straight from the URL slug, so every method must
+    # verify the caller is an active member of that workspace. Without this the
+    # endpoint is a cross-workspace IDOR (the public-API sibling of the
+    # CVE-2026-46558 dashboard fix).
+    permission_classes = [WorkspaceUserPermission]
+
     use_read_replica = True
 
     @asset_docs(
@@ -437,10 +445,19 @@ class GenericAssetEndpoint(BaseAPIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # Generate presigned URL for GET
+            # Generate presigned URL for GET.
+            # Force attachment disposition for script-capable MIME types (e.g. SVG)
+            # to prevent same-origin XSS when the asset URL shares the app's origin
+            # (default MinIO self-hosted setup).
             storage = S3Storage(request=request, is_server=True)
+            asset_mime_type = (asset.attributes.get("type") or "").split(";")[0].strip().lower()
+            disposition = (
+                "attachment" if asset_mime_type in settings.SCRIPT_CAPABLE_MIME_TYPES else "inline"
+            )
             presigned_url = storage.generate_presigned_url(
-                object_name=asset.asset.name, filename=asset.attributes.get("name")
+                object_name=asset.asset.name,
+                filename=asset.attributes.get("name"),
+                disposition=disposition,
             )
 
             return Response(
@@ -517,7 +534,7 @@ class GenericAssetEndpoint(BaseAPIView):
         size_limit = min(size, settings.FILE_SIZE_LIMIT)
 
         # Check if the file type is allowed
-        if not type or type not in settings.ATTACHMENT_MIME_TYPES:
+        if not is_allowed_attachment_type(type):
             return Response(
                 {"error": "Invalid file type.", "status": False},
                 status=status.HTTP_400_BAD_REQUEST,

@@ -16,9 +16,11 @@ handler404 = "plane.app.views.error_404.custom_404_view"
 
 urlpatterns = [
     path("api/", include("plane.app.urls")),
+    path("api/", include("plane.ce_integrations.urls")),
     path("api/public/", include("plane.space.urls")),
     path("api/instances/", include("plane.license.urls")),
     path("api/v1/", include("plane.api.urls")),
+    path("api/v1/", include("plane.connections.urls")),
     path("auth/", include("plane.authentication.urls")),
     path("", include("plane.web.urls")),
 ]

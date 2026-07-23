@@ -11,10 +11,12 @@ import { EUserPermissions, EUserPermissionsLevel } from "@plane/constants";
 import { NotAuthorizedView } from "@/components/auth-screens/not-authorized-view";
 import { PageHead } from "@/components/core/page-title";
 import { SingleIntegrationCard } from "@/components/integration/single-integration-card";
+import { SiloGithubCard } from "@/components/integration/silo-github-card";
+import { SiloSlackCard } from "@/components/integration/silo-slack-card";
 import { IntegrationAndImportExportBanner } from "@/components/ui/integration-and-import-export-banner";
 import { IntegrationsSettingsLoader } from "@/components/ui/loader/settings/integration";
 // constants
-import { APP_INTEGRATIONS } from "@/constants/fetch-keys";
+import { APP_INTEGRATIONS } from "@plane/constants";
 // hooks
 import { useWorkspace } from "@/hooks/store/use-workspace";
 import { useUserPermissions } from "@/hooks/store/user";
@@ -40,13 +42,15 @@ function WorkspaceIntegrationsPage() {
   return (
     <>
       <PageHead title={pageTitle} />
-      <section className="w-full overflow-y-auto">
+      <section className="w-full overflow-y-auto pl-4">
         <IntegrationAndImportExportBanner bannerName="Integrations" />
         <div>
+          <SiloSlackCard />
+          <SiloGithubCard />
           {appIntegrations ? (
-            appIntegrations.map((integration) => (
-              <SingleIntegrationCard key={integration.id} integration={integration} />
-            ))
+            appIntegrations
+              .filter((integration) => integration.provider !== "slack" && integration.provider !== "github")
+              .map((integration) => <SingleIntegrationCard key={integration.id} integration={integration} />)
           ) : (
             <IntegrationsSettingsLoader />
           )}

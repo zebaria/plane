@@ -22,6 +22,13 @@ export const PROJECT_SETTINGS_CATEGORIES: PROJECT_SETTINGS_CATEGORY[] = [
   PROJECT_SETTINGS_CATEGORY.EXECUTION,
 ];
 
+export const PROJECT_SETTINGS_CATEGORY_LABELS: Record<PROJECT_SETTINGS_CATEGORY, string> = {
+  [PROJECT_SETTINGS_CATEGORY.GENERAL]: "common.general",
+  [PROJECT_SETTINGS_CATEGORY.FEATURES]: "common.features",
+  [PROJECT_SETTINGS_CATEGORY.WORK_STRUCTURE]: "common.work_structure",
+  [PROJECT_SETTINGS_CATEGORY.EXECUTION]: "common.execution",
+};
+
 export const PROJECT_SETTINGS: Record<TProjectSettingsTabs, TProjectSettingsItem> = {
   general: {
     key: "general",
@@ -100,6 +107,13 @@ export const PROJECT_SETTINGS: Record<TProjectSettingsTabs, TProjectSettingsItem
     access: [EUserProjectRoles.ADMIN],
     highlight: (pathname: string, baseUrl: string) => pathname === `${baseUrl}/automations/`,
   },
+  notifications: {
+    key: "notifications",
+    i18n_label: "Notifications",
+    href: `/notifications`,
+    access: [EUserProjectRoles.ADMIN],
+    highlight: (pathname: string, baseUrl: string) => pathname === `${baseUrl}/notifications/`,
+  },
 };
 
 export const PROJECT_SETTINGS_FLAT_MAP: TProjectSettingsItem[] = Object.values(PROJECT_SETTINGS);
@@ -118,5 +132,5 @@ export const GROUPED_PROJECT_SETTINGS: Record<PROJECT_SETTINGS_CATEGORY, TProjec
     PROJECT_SETTINGS["labels"],
     PROJECT_SETTINGS["estimates"],
   ],
-  [PROJECT_SETTINGS_CATEGORY.EXECUTION]: [PROJECT_SETTINGS["automations"]],
+  [PROJECT_SETTINGS_CATEGORY.EXECUTION]: [PROJECT_SETTINGS["automations"], PROJECT_SETTINGS["notifications"]],
 };
