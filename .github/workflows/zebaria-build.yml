@@ -8,14 +8,15 @@ name: Zebaria - Build & Push to ECR
 # Repo secrets required:
 #   AWS_ACCOUNT_ID — 12-digit account number
 #
-# Triggers: push to preview or main, manual dispatch, and pushes of
-# tags matching v*.
+# Triggers: push to preview, main, or master, manual dispatch, and
+# pushes of tags matching v*.
 
 on:
   push:
     branches:
       - preview
       - main
+      - master
     tags:
       - 'v*'
   workflow_dispatch:
