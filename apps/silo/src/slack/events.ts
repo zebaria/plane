@@ -183,7 +183,12 @@ export const slackEventsRouter = (): Router => {
 
       let payload: SlackEvent;
       try {
-        payload = JSON.parse(rawBody.toString("utf8"));
+        const parsed: unknown = JSON.parse(rawBody.toString("utf8"));
+        if (typeof parsed !== "object" || parsed === null) {
+          res.status(400).type("text/plain").send("invalid payload");
+          return;
+        }
+        payload = parsed as SlackEvent;
       } catch {
         res.status(400).type("text/plain").send("invalid json");
         return;
