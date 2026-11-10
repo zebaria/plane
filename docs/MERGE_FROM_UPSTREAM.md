@@ -151,12 +151,16 @@ ping and a Slack/GitHub round-trip still work if those areas changed).
 git commit            # records the merge on sync-upstream-preview
 
 git switch preview
-git merge --ff-only sync-upstream-preview   # or review-merge
+git merge --ff-only sync-upstream-preview
+git push origin preview
 git branch -d sync-upstream-preview
 ```
 
-Push `preview` only through the normal flow (`ship`), not a bare
-`git push` — see the repo's no-direct-push convention.
+Upstream merges are the one case that does NOT go through `ship`.
+`ship` squash-merges by design, and a squash drops the link to
+upstream's commits — the next sync would then re-merge everything and
+hit the same conflicts again. The merge commit must land on `preview`
+as-is, so fast-forward `preview` and push it to `origin` by hand.
 
 ## Why this is usually low-conflict
 
@@ -187,4 +191,5 @@ rather than blindly resolving.
 - ❌ Hand-edit `pnpm-lock.yaml` conflict hunks — regenerate instead.
 - ❌ Resolve a `package.json` catalog conflict by dropping our explicit
   test deps — keep both sides.
-- ❌ `git push` to `preview` directly — use `ship`.
+- ❌ Send an upstream merge through `ship` — it squashes and loses
+  the upstream ancestry. Fast-forward and push `preview` (step 7).
