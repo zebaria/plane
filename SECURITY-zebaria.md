@@ -21,10 +21,11 @@ This is a public fork of makeplane/plane. Treat it as such:
    trusts only this repo. The only repo secret needed is
    `AWS_ACCOUNT_ID`, which gets masked in logs.
 
-4. **Be careful when rebasing on upstream.** A malicious upstream commit
+4. **Be careful when merging from upstream.** A malicious upstream commit
    could try to add a workflow that exfiltrates secrets. Always review
-   `.github/workflows/*.yml` changes during rebases. If anything looks
-   off, disable the workflow before pushing.
+   `.github/workflows/*.yml` changes during upstream merges (step 3 of
+   `docs/MERGE_FROM_UPSTREAM.md`). If anything looks off, disable the
+   workflow before pushing.
 
 5. **Never reference internal hostnames or AWS resource IDs in code or
    docs in this fork** unless they're already public (e.g. the public
