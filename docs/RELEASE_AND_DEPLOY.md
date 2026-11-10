@@ -16,8 +16,9 @@ Release tooling is **vibegrunt** (`.vibegrunt.toml`), driven by the
 feature branch ─PR→ preview ─promote→ master
 ```
 
-- Feature work: PR into `preview`. Infra/upstream-merge work can push
-  `preview` directly (see `MERGE_FROM_UPSTREAM.md`).
+- Everything reaches `preview` through `ship` — feature work and
+  upstream merges alike (see `MERGE_FROM_UPSTREAM.md`). No bare
+  `git push` to `preview`.
 - `promote` opens a `preview → master` PR.
 - `promote --merge <N>` merges it and resets `preview` onto master.
 - Always pass `--repo zebaria/plane` on `gh` commands — the fork has
