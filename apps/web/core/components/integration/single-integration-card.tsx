@@ -8,11 +8,11 @@ import { useState } from "react";
 import { observer } from "mobx-react";
 import { useParams } from "next/navigation";
 import useSWR, { mutate } from "swr";
-import { CheckCircle } from "lucide-react";
+import { TickCircleOutline } from "@makeplane/propel/icons";
 import { EUserPermissions, EUserPermissionsLevel } from "@plane/constants";
 import { Button } from "@plane/propel/button";
 import { TOAST_TYPE, setToast } from "@plane/propel/toast";
-import { Tooltip } from "@plane/propel/tooltip";
+import { Tooltip } from "@makeplane/propel/components/tooltip";
 import type { IAppIntegration, IWorkspaceIntegration } from "@plane/types";
 // ui
 import { Loader } from "@plane/ui";
@@ -73,7 +73,9 @@ export const SingleIntegrationCard = observer(function SingleIntegrationCard({ i
   const handleRemoveIntegration = async () => {
     if (!workspaceSlug || !integration || !workspaceIntegrations) return;
 
-    const workspaceIntegrationId = workspaceIntegrations?.find((i) => i.integration === integration.id)?.id;
+    const workspaceIntegrationId = Array.isArray(workspaceIntegrations)
+      ? workspaceIntegrations.find((i) => i.integration === integration.id)?.id
+      : undefined;
 
     setDeletingIntegration(true);
 
@@ -104,7 +106,9 @@ export const SingleIntegrationCard = observer(function SingleIntegrationCard({ i
       });
   };
 
-  const isInstalled = workspaceIntegrations?.find((i: any) => i.integration_detail.id === integration.id);
+  const isInstalled = Array.isArray(workspaceIntegrations)
+    ? workspaceIntegrations.find((i: IWorkspaceIntegration) => i.integration_detail.id === integration.id)
+    : undefined;
 
   return (
     <div className="flex items-center justify-between gap-2 border-b border-subtle bg-surface-1 px-4 py-6">
@@ -120,7 +124,7 @@ export const SingleIntegrationCard = observer(function SingleIntegrationCard({ i
           <h3 className="flex items-center gap-2 text-body-xs-medium">
             {integration.title}
             {workspaceIntegrations
-              ? isInstalled && <CheckCircle className="h-3.5 w-3.5 fill-transparent text-success-primary" />
+              ? isInstalled && <TickCircleOutline className="h-3.5 w-3.5 fill-transparent text-success-primary" />
               : null}
           </h3>
           <p className="text-body-xs-regular text-secondary">
@@ -136,9 +140,9 @@ export const SingleIntegrationCard = observer(function SingleIntegrationCard({ i
       {workspaceIntegrations ? (
         isInstalled ? (
           <Tooltip
-            isMobile={isMobile}
-            disabled={isUserAdmin}
-            tooltipContent={!isUserAdmin ? "You don't have permission to perform this" : null}
+            label={!isUserAdmin ? "You don't have permission to perform this" : ""}
+            layout="stacked"
+            disabled={isUserAdmin || isMobile}
           >
             <Button
               className={`${!isUserAdmin ? "hover:cursor-not-allowed" : ""}`}
@@ -155,9 +159,9 @@ export const SingleIntegrationCard = observer(function SingleIntegrationCard({ i
           </Tooltip>
         ) : (
           <Tooltip
-            isMobile={isMobile}
-            disabled={isUserAdmin}
-            tooltipContent={!isUserAdmin ? "You don't have permission to perform this" : null}
+            label={!isUserAdmin ? "You don't have permission to perform this" : ""}
+            layout="stacked"
+            disabled={isUserAdmin || isMobile}
           >
             <Button
               className={`${!isUserAdmin ? "hover:cursor-not-allowed" : ""}`}

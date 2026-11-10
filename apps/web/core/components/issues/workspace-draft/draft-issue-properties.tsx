@@ -8,7 +8,7 @@ import { useCallback, useMemo } from "react";
 import { observer } from "mobx-react";
 import { useParams } from "next/navigation";
 // icons
-import { DueDatePropertyIcon, StartDatePropertyIcon } from "@plane/propel/icons";
+import { DueDateOutline, StartDateOutline } from "@makeplane/propel/icons";
 // types
 import type { TIssuePriorities, TWorkspaceDraftIssue } from "@plane/types";
 import { getDate, renderFormattedPayloadDate, shouldHighlightIssueDueDate } from "@plane/utils";
@@ -122,7 +122,11 @@ export const DraftIssueProperties = observer(function DraftIssueProperties(props
 
   if (!issue.project_id) return null;
 
-  const defaultLabelOptions = issue?.label_ids?.map((id) => labelMap[id]) || [];
+  const defaultLabelOptions =
+    issue?.label_ids?.flatMap((id) => {
+      const label = labelMap[id];
+      return label ? [label] : [];
+    }) || [];
 
   const minDate = getDate(issue.start_date);
   minDate?.setDate(minDate.getDate());
@@ -181,7 +185,7 @@ export const DraftIssueProperties = observer(function DraftIssueProperties(props
           onChange={handleStartDate}
           maxDate={maxDate}
           placeholder="Start date"
-          icon={<StartDatePropertyIcon className="h-3 w-3 flex-shrink-0" />}
+          icon={<StartDateOutline className="h-3 w-3 flex-shrink-0" />}
           buttonVariant={issue.start_date ? "border-with-text" : "border-without-text"}
           optionsClassName="z-10"
           renderByDefault={isMobile}
@@ -196,7 +200,7 @@ export const DraftIssueProperties = observer(function DraftIssueProperties(props
           onChange={handleTargetDate}
           minDate={minDate}
           placeholder="Due date"
-          icon={<DueDatePropertyIcon className="h-3 w-3 flex-shrink-0" />}
+          icon={<DueDateOutline className="h-3 w-3 flex-shrink-0" />}
           buttonVariant={issue.target_date ? "border-with-text" : "border-without-text"}
           buttonClassName={
             shouldHighlightIssueDueDate(issue?.target_date || null, stateDetails?.group) ? "text-danger-primary" : ""
