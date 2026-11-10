@@ -13,8 +13,6 @@ We do not encrypt token columns at rest; matching upstream for now.
 Revisit when we onboard a second tenant.
 """
 
-import uuid
-
 from django.db import models
 from django.db.models import Q
 
