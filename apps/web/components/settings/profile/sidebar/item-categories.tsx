@@ -5,12 +5,19 @@
  */
 
 import type React from "react";
-import type { LucideIcon } from "lucide-react";
-import { Plug } from "lucide-react";
-import { KeyOutline, LockOutline, SettingsOutline, SubscribeOutline, UserOutline } from "@makeplane/propel/icons";
+import type { IconGlyph } from "@makeplane/propel/components/icon";
+import {
+  IntegrationsOutline,
+  KeyOutline,
+  LockOutline,
+  SettingsOutline,
+  SubscribeOutline,
+  UserOutline,
+} from "@makeplane/propel/icons";
 import { observer } from "mobx-react";
 import { useParams } from "react-router";
 // plane imports
+import { List } from "@makeplane/propel/components/list";
 import {
   GROUPED_PROFILE_SETTINGS,
   PROFILE_SETTINGS_CATEGORIES,
@@ -21,14 +28,15 @@ import type { ISvgIcons } from "@plane/blocks/icons";
 import type { TProfileSettingsTabs } from "@plane/types";
 // local imports
 import { SettingsSidebarItem } from "../../sidebar/item";
+import { SettingsSidebarSectionHeading } from "../../sidebar/section-heading";
 import { ProfileSettingsSidebarWorkspaceOptions } from "./workspace-options";
 
-const ICONS: Record<TProfileSettingsTabs, LucideIcon | React.FC<ISvgIcons>> = {
+const ICONS: Record<TProfileSettingsTabs, IconGlyph | React.FC<ISvgIcons>> = {
   general: UserOutline,
   security: LockOutline,
   preferences: SettingsOutline,
   notifications: SubscribeOutline,
-  connections: Plug,
+  connections: IntegrationsOutline,
   "api-tokens": KeyOutline,
 };
 
@@ -55,10 +63,10 @@ export const ProfileSettingsSidebarItemCategories = observer(function ProfileSet
 
         return (
           <div key={category} className="shrink-0">
-            <div className="p-2 text-caption-md-medium text-tertiary capitalize">
+            <SettingsSidebarSectionHeading>
               {t(PROFILE_SETTINGS_CATEGORY_LABELS[category])}
-            </div>
-            <div className="flex flex-col">
+            </SettingsSidebarSectionHeading>
+            <List gap="px" role="toolbar" aria-label={t(PROFILE_SETTINGS_CATEGORY_LABELS[category])}>
               {categoryItems.map((item) => (
                 <SettingsSidebarItem
                   key={item.key}
@@ -69,7 +77,7 @@ export const ProfileSettingsSidebarItemCategories = observer(function ProfileSet
                   label={t(item.i18n_label)}
                 />
               ))}
-            </div>
+            </List>
           </div>
         );
       })}

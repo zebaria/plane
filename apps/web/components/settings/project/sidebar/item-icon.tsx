@@ -4,8 +4,7 @@
  * See the LICENSE file for details.
  */
 
-import type { LucideIcon } from "lucide-react";
-import { Bell } from "lucide-react";
+import type { IconGlyph } from "@makeplane/propel/components/icon";
 import {
   CyclesOutline,
   EstimateOutline,
@@ -15,6 +14,7 @@ import {
   ModuleOutline,
   PagesOutline,
   StateOutline,
+  SubscribeOutline,
   TriggerOutline,
   ViewsOutline,
 } from "@makeplane/propel/icons";
@@ -24,7 +24,7 @@ import type { TProjectSettingsTabs } from "@plane/types";
 // components
 import { SettingIcon } from "@/components/icons/attachment";
 
-export const PROJECT_SETTINGS_ICONS: Record<TProjectSettingsTabs, LucideIcon | React.FC<ISvgIcons>> = {
+export const PROJECT_SETTINGS_ICONS: Record<TProjectSettingsTabs, IconGlyph | React.FC<ISvgIcons>> = {
   general: SettingIcon,
   members: MembersOutline,
   features_cycles: CyclesOutline,
@@ -36,5 +36,5 @@ export const PROJECT_SETTINGS_ICONS: Record<TProjectSettingsTabs, LucideIcon | R
   labels: LabelsOutline,
   estimates: EstimateOutline,
   automations: TriggerOutline,
-  notifications: Bell,
+  notifications: SubscribeOutline,
 };

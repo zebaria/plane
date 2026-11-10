@@ -14,7 +14,7 @@
 import { useState } from "react";
 import { observer } from "mobx-react";
 import useSWR, { mutate } from "swr";
-import { Trash2 } from "lucide-react";
+import { DeleteOutline } from "@makeplane/propel/icons";
 
 import { Button } from "@makeplane/propel/components/button";
 import { IconButton } from "@makeplane/propel/components/icon-button";
@@ -154,7 +154,7 @@ export const ProjectSlackNotificationsRoot = observer(function ProjectSlackNotif
                 variant="danger-outline"
                 onClick={() => handleDelete(m.id)}
                 loading={deletingId === m.id}
-                icon={<Trash2 className="size-3.5" />}
+                icon={<DeleteOutline className="size-3.5" />}
                 aria-label="Remove channel mapping"
               />
             </div>

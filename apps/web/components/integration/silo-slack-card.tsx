@@ -7,7 +7,7 @@ import { useState } from "react";
 import { observer } from "mobx-react";
 import { useParams } from "next/navigation";
 import useSWR, { mutate } from "swr";
-import { CheckCircle } from "lucide-react";
+import { TickCircleOutline } from "@makeplane/propel/icons";
 
 import { EUserPermissions, EUserPermissionsLevel } from "@plane/constants";
 import { Button } from "@makeplane/propel/components/button";
@@ -86,7 +86,7 @@ export const SiloSlackCard = observer(function SiloSlackCard() {
           <div>
             <h3 className="flex items-center gap-2 text-body-xs-medium">
               Slack
-              {installed ? <CheckCircle className="h-3.5 w-3.5 fill-transparent text-success-primary" /> : null}
+              {installed ? <TickCircleOutline className="h-3.5 w-3.5 fill-transparent text-success-primary" /> : null}
             </h3>
             <p className="text-body-xs-regular text-secondary">
               {installed
