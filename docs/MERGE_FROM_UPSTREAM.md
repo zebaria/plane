@@ -6,13 +6,17 @@ mistakes that bit us before.
 
 ## Ground rules (read first)
 
-- **Do NOT add a permanent `upstream` remote.** We deliberately removed
-  it. A persistent remote led to PRs being opened against
-  `makeplane/plane` by mistake. Always fetch upstream by **one-off
-  URL**, which writes nothing to `.git/config`.
+- **Upstream (`makeplane/plane`) is READ ONLY. We never push to it,
+  never open a PR/issue/comment on it, never write to it in any way.**
+  The only thing we do with upstream is fetch in step 2. Every push in
+  this runbook goes to `origin` (`zebaria/plane`) and nowhere else.
+- **The `upstream` remote is temporary.** Add it only for the fetch in
+  step 2 (with its push URL disabled) and **remove it immediately**
+  after. A lingering upstream remote is how our changes got pushed to
+  `makeplane/plane` by mistake.
 - **`origin` is `git@github.com:zebaria/plane.git` and is the only
-  remote.** Confirm with `git remote -v` before and after — it must
-  stay that way.
+  remote outside step 2.** Confirm with `git remote -v` before and
+  after — it must stay that way.
 - **Never merge straight onto `preview`.** Do the merge on a throwaway
   sync branch, verify, then fast-forward/merge into `preview` yourself.
 - Our integration code (`apps/silo/`, `apps/api/plane/connections/`,
@@ -36,14 +40,21 @@ git status --short          # must be empty
 git remote -v               # must show ONLY origin → zebaria/plane
 ```
 
-### 2. Ephemeral fetch from upstream
+### 2. Temporary upstream remote: add, fetch, remove
 
-No remote added — fetch by URL into `FETCH_HEAD`:
+Add the remote, disable pushes to it, fetch, and remove it right away —
+nothing else happens while it exists:
 
 ```bash
-git fetch --no-tags https://github.com/makeplane/plane.git preview
-git remote -v               # re-confirm: still ONLY origin
+git remote add upstream https://github.com/makeplane/plane.git
+git remote set-url --push upstream DISABLED   # any push to it fails
+git fetch --no-tags upstream preview          # sets FETCH_HEAD
+git remote remove upstream                    # immediately
+git remote -v               # re-confirm: ONLY origin
 ```
+
+The rest of the runbook uses `FETCH_HEAD`, so the remote isn't needed
+after the fetch.
 
 ### 3. See what's incoming before merging
 
@@ -168,8 +179,10 @@ rather than blindly resolving.
 
 ## What NOT to do
 
-- ❌ `git remote add upstream ...` (permanent remote → accidental
-  upstream PRs).
+- ❌ **Push, open a PR, or write anything to `makeplane/plane`.**
+  Upstream is read-only. If a command would target it, stop.
+- ❌ Leave the `upstream` remote in place after the fetch. Remove it
+  immediately.
 - ❌ Merge FETCH_HEAD directly onto `preview`.
 - ❌ Hand-edit `pnpm-lock.yaml` conflict hunks — regenerate instead.
 - ❌ Resolve a `package.json` catalog conflict by dropping our explicit
