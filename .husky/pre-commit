@@ -36,4 +36,25 @@ if [ "$branch" = "preview" ]; then
     fi
 fi
 
+# check-version also requires apps/api/pyproject.toml's version to equal
+# package.json's, and neither the bump above nor ship's bumpversion-vg
+# touches pyproject.toml. Whenever package.json's version is staged
+# (any branch), copy it into pyproject.toml and refresh uv.lock.
+root="$(git rev-parse --show-toplevel)"
+pyproject="$root/apps/api/pyproject.toml"
+if [ -f "$pyproject" ]; then
+    staged_ver=$(git show :package.json 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    api_ver=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$pyproject" | head -1)
+    if [ -n "$staged_ver" ] && [ -n "$api_ver" ] && [ "$staged_ver" != "$api_ver" ]; then
+        perl -i -pe 'if (!$done && s/^(version\s*=\s*")[^"]*(")/${1}'"$staged_ver"'${2}/) { $done = 1 }' "$pyproject"
+        uv_pin=$(sed -n 's/^required-version[[:space:]]*=[[:space:]]*"==\([^"]*\)".*/\1/p' "$pyproject" | head -1)
+        if ! (cd "$root/apps/api" && uvx "uv@${uv_pin:-latest}" lock --quiet); then
+            echo "pre-commit: failed to refresh apps/api/uv.lock after setting version $staged_ver" >&2
+            exit 1
+        fi
+        git add "$pyproject" "$root/apps/api/uv.lock"
+        echo "pre-commit: synced apps/api/pyproject.toml version $api_ver -> $staged_ver (staged)"
+    fi
+fi
+
 pnpm lint-staged
