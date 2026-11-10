@@ -46,23 +46,21 @@ vi.mock("@/hooks/store/use-project-state", () => ({
   }),
 }));
 
-vi.mock("@plane/propel/toast", () => ({
-  TOAST_TYPE: { SUCCESS: "success", ERROR: "error" },
+vi.mock("@plane/blocks/toast", () => ({
   setToast: vi.fn(),
 }));
 
-// `@plane/ui` and `@plane/propel/button` pull in heavy bundles; stub
-// to bare-bones DOM so the modal renders in jsdom.
-vi.mock("@plane/ui", () => ({
-  ModalCore: ({ children }: { children: React.ReactNode }) => <div role="dialog">{children}</div>,
-  EModalPosition: { CENTER: "center" },
-  EModalWidth: { XL: "xl" },
+// The propel dialog and button pull in heavy bundles; stub to
+// bare-bones DOM so the modal renders in jsdom.
+vi.mock("@makeplane/propel/components/dialog", () => ({
+  Dialog: ({ children }: { children: React.ReactNode }) => <div role="dialog">{children}</div>,
+  DialogContent: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
-vi.mock("@plane/propel/button", () => ({
-  Button: ({ children, onClick, disabled, loading }: any) => (
+vi.mock("@makeplane/propel/components/button", () => ({
+  Button: ({ label, onClick, disabled, loading }: any) => (
     <button onClick={onClick} disabled={disabled || loading}>
-      {children}
+      {label}
     </button>
   ),
 }));

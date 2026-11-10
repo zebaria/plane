@@ -5,7 +5,7 @@
 
 import { observer } from "mobx-react";
 import { PROJECT_SETTINGS } from "@plane/constants";
-import { Breadcrumbs } from "@plane/ui";
+import { Breadcrumbs } from "@plane/blocks/breadcrumb";
 
 import { BreadcrumbLink } from "@/components/common/breadcrumb-link";
 import { SettingsPageHeader } from "@/components/settings/page-header";
