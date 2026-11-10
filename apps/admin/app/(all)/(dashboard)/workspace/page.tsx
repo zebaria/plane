@@ -131,15 +131,15 @@ const WorkspaceManagementPage = observer(function WorkspaceManagementPage(_props
                 <div className="pb-1 text-16 font-medium">Allow all attachment file types.</div>
                 <div className={cn("text-11 leading-5 font-regular text-tertiary")}>
                   Toggling this on lets members upload attachments of any file type instead of the built-in allowed
-                  list. Script-capable files (HTML, SVG, JS) are always force-downloaded rather than shown inline.
+                  list. Only allow-listed image types are shown inline; every other file is downloaded.
                 </div>
               </div>
             </div>
             <div className={`shrink-0 pr-4 ${isSubmitting && "opacity-70"}`}>
               <div className="flex items-center gap-4">
-                <ToggleSwitch
-                  value={Boolean(parseInt(enableAllAttachmentTypes))}
-                  onChange={() => {
+                <Switch
+                  checked={Boolean(parseInt(enableAllAttachmentTypes))}
+                  onCheckedChange={() => {
                     if (Boolean(parseInt(enableAllAttachmentTypes)) === true) {
                       updateConfig("ENABLE_ALL_ATTACHMENT_TYPES", "0");
                     } else {
@@ -147,6 +147,7 @@ const WorkspaceManagementPage = observer(function WorkspaceManagementPage(_props
                     }
                   }}
                   size="sm"
+                  aria-label="Allow all attachment file types"
                   disabled={isSubmitting}
                 />
               </div>
