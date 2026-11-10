@@ -103,8 +103,10 @@ const validateAndDetectFileType = async (file: File): Promise<string> => {
     console.warn("Error detecting file type from signature:", _error);
   }
 
-  // fallback for unknown files
-  return "";
+  // Text formats (txt, csv, json, md, ...) have no magic-byte signature, so
+  // signature detection returns "" for them. Fall back to the browser-reported
+  // type; the server still checks it against its attachment allowlist.
+  return file.type || "";
 };
 
 /**

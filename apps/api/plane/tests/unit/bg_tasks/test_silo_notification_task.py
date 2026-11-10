@@ -19,7 +19,6 @@ import json
 from unittest.mock import patch
 
 import pytest
-from django.test import override_settings
 
 from plane.bgtasks.silo_notification_task import (
     GITHUB_REPO_TYPE,

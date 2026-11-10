@@ -8,8 +8,7 @@ name: Zebaria - Build & Push to ECR
 # Repo secrets required:
 #   AWS_ACCOUNT_ID — 12-digit account number
 #
-# Triggers: push to preview, main, or master, manual dispatch, and
-# pushes of tags matching v*.
+# Triggers: push to preview, main, or master, and manual dispatch.
 
 on:
   push:
@@ -17,12 +16,10 @@ on:
       - preview
       - main
       - master
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag_override:
-        description: "Override image tag (default: branch or tag name)"
+        description: "Override image tag (default: branch name)"
         required: false
         default: ""
 
@@ -174,6 +171,7 @@ jobs:
               "docker compose -f /opt/plane/docker-compose.yml pull",
               "systemctl restart plane.service",
               "systemctl is-active plane.service",
+              "docker image prune -af",
               "docker compose -f /opt/plane/docker-compose.yml ps"
             ]}' \
             --query 'Command.CommandId' --output text)
@@ -247,6 +245,7 @@ jobs:
               "docker compose -f /opt/plane/docker-compose.yml pull",
               "systemctl restart plane.service",
               "systemctl is-active plane.service",
+              "docker image prune -af",
               "docker compose -f /opt/plane/docker-compose.yml ps"
             ]}' \
             --query 'Command.CommandId' --output text)

@@ -308,11 +308,9 @@ cmd_deps_only() {
   fi
   if [[ ! -x apps/api/.venv/bin/python ]] \
      || ! apps/api/.venv/bin/python -c 'import sys; assert sys.version_info >= (3,12)' 2>/dev/null; then
-    echo "==> Creating apps/api/.venv (Python 3.12) and installing requirements via uv"
+    echo "==> Creating apps/api/.venv (Python 3.12) and syncing deps from uv.lock"
     rm -rf apps/api/.venv
-    (cd apps/api && \
-       uv venv --python 3.12 .venv && \
-       uv pip install --python .venv/bin/python -r requirements/local.txt)
+    (cd apps/api && uvx uv@0.12.21 sync --locked --python 3.12)
   fi
 
   # Wait for postgres + rabbitmq to be reachable before running
