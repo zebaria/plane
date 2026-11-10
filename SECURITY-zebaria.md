@@ -34,3 +34,22 @@ This is a public fork of makeplane/plane. Treat it as such:
 
 6. **The Slack manifest** and any integration-related docs go in
    `corpinfra/terraform/modules/plane/` — never in this fork.
+
+7. **Upstream (`makeplane/plane`) is read-only.** Never push, open a
+   PR/issue/comment, or write anything to it — our changes have been
+   pushed there by mistake before. The `upstream` remote exists only for
+   the fetch during a sync (push URL disabled) and is removed right
+   after; `git remote` must otherwise show only `origin`. Always pass
+   `--repo zebaria/plane` to `gh`: GitHub treats the fork's parent as
+   the default PR target.
+
+8. **Re-check the attachment toggle after every upstream merge.** Our
+   god-mode "Allow all attachment file types" switch
+   (`plane/utils/attachment.py`) is only safe because files are served
+   so that nothing script-capable renders inline (today: inline only
+   for allow-listed images, everything else downloads). If upstream
+   changes how assets are served (`S3Storage`, `generate_presigned_url`,
+   the asset views), confirm a non-image upload still downloads rather
+   than rendering, and that every upload path still goes through
+   `is_allowed_attachment_type` — a new upload endpoint that checks
+   `settings.ATTACHMENT_MIME_TYPES` directly would bypass the toggle.

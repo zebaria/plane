@@ -249,10 +249,20 @@ show up in a browser:
   reset it.
 - Settings pages (profile / project / workspace sidebars).
 - Integrations: Slack + GitHub cards, and a real Slack/GitHub
-  round-trip through silo (the silo→Django HMAC ping).
+  round-trip through silo (the silo→Django HMAC ping). For Slack,
+  create a work item in a project with a channel mapping and confirm
+  the message lands. If it doesn't, the silo log shows each step
+  (`notifications event_type=…`, `dispatch channel mappings=N`); silo
+  only logs a post when it _fails_, so silence after `mappings=N`
+  usually means the message went to a different mapped channel or no
+  mapping subscribes to that event — check the project's
+  Notifications settings before suspecting the merge.
 - Work item attachments: a non-image file (e.g. `.txt`) through the
   paperclip, and the god-mode "Allow all attachment file types"
-  toggle.
+  toggle — with it on, a non-allowlisted type uploads; with it off,
+  the API returns 400 "Invalid file type". The paperclip is the only
+  any-type upload; comment/description editor uploads are images only
+  by design.
 
 ### 7. Commit the merge, then bring it into preview
 
