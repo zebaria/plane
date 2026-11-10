@@ -174,6 +174,7 @@ jobs:
               "docker compose -f /opt/plane/docker-compose.yml pull",
               "systemctl restart plane.service",
               "systemctl is-active plane.service",
+              "docker image prune -af",
               "docker compose -f /opt/plane/docker-compose.yml ps"
             ]}' \
             --query 'Command.CommandId' --output text)
@@ -247,6 +248,7 @@ jobs:
               "docker compose -f /opt/plane/docker-compose.yml pull",
               "systemctl restart plane.service",
               "systemctl is-active plane.service",
+              "docker image prune -af",
               "docker compose -f /opt/plane/docker-compose.yml ps"
             ]}' \
             --query 'Command.CommandId' --output text)
