@@ -1,6 +1,6 @@
 # Releasing and deploying Plane (zebaria fork)
 
-_Last updated: 2026-07-23._
+_Last updated: 2026-11-11._
 
 How code gets from a feature branch to `plane.wildzebra.com`. Read
 alongside `MERGE_FROM_UPSTREAM.md` (pulling upstream) and
@@ -29,70 +29,59 @@ feature branch ─PR→ preview ─promote→ master
 ## The version bump (check-version gate)
 
 CI `check-version` **fails any promote PR whose `package.json` version
-equals master's**, and `promote` does not bump automatically. This is
-handled by `.husky/pre-commit`: on the `preview` branch, if the version
-still equals `origin/master`'s, it patch-bumps `package.json` and stages
-it — so the first commit of each promote cycle bumps once, later commits
-skip. **If that hook is bypassed (`--no-verify`) or removed, bump
-`package.json` manually before `promote`** or the promote PR goes red.
+equals master's, or whose `apps/api/pyproject.toml` version differs from
+`package.json`'s**. `promote` does not bump automatically; `ship` bumps
+the patch on every feature PR. `.husky/pre-commit` keeps both rules
+satisfied:
+
+- On the `preview` branch, if the version still equals
+  `origin/master`'s, it patch-bumps `package.json` and stages it — so
+  the first commit of each promote cycle bumps once.
+- On any branch, whenever a `package.json` version is staged, it copies
+  that version into `apps/api/pyproject.toml` and refreshes
+  `apps/api/uv.lock`.
+
+**If that hook is bypassed (`--no-verify`) or removed, bump both files
+by hand (and run `uvx uv@<required-version> lock` in `apps/api`) before
+`promote`** or the promote PR goes red.
 
 ## CI: build + deploy (`.github/workflows/zebaria-build.yml`)
 
-Triggers on push to `preview`, `main`, or `master`, on `v*` tags, and
-manual dispatch. Builds the 6 images and pushes to ECR in us-east-1 (dev)
-and us-west-2 (prod), tagged with the branch/tag name.
+Triggers on push to `preview`, `main`, or `master`, and on manual
+dispatch (not on tags — `ship --merge` pushes a `v*` tag, which used to
+start a redundant second build). Builds the 7 images (admin, frontend,
+space, live, proxy, backend, silo) and pushes them to ECR in us-east-1
+(dev) and us-west-2 (prod), tagged with the branch name.
 
-- **`deploy-dev`** — auto-rolls the dev host on a `preview` push
-  (`:preview` image). Pull + restart only; host config files
-  (docker-compose.yml, render-env.sh, ecr-login.sh) are owned by
-  `deploy-config.sh` and are NOT touched.
-- **`deploy-prod`** — same mechanics, gated on `master`, us-west-2.
+- **`deploy-dev`** — on a `preview` push, rolls the dev host
+  (us-east-1). Pull + restart only.
+- **`deploy-prod`** — on a `master` push (i.e. `promote --merge`), rolls
+  the prod host (us-west-2) the same way.
 
-## ⚠️ Prod auto-deploy is NOT reliable yet
+Both jobs find the host by tag, then SSM `AWS-RunShellScript`:
+`ecr-login.sh`, `docker compose pull`, `systemctl restart plane.service`,
+`docker image prune -af`. Host config files (docker-compose.yml,
+render-env.sh, ecr-login.sh) are owned by corpinfra's
+`deploy-config.sh` and are NOT touched by CI.
 
-Two known problems with `deploy-prod`:
+**IAM roles** (corpinfra `terraform/modules/plane_dev/oidc.tf`):
 
-1. **Racy trigger.** `promote --merge` pushes the merge commit to
-   `master` and resets `preview` to the same SHA near-simultaneously.
-   GitHub often dedupes the workflow run onto the `preview` ref, so no
-   `master`-ref run fires and `deploy-prod` (`if: github.ref ==
-'refs/heads/master'`) never runs. It fired for one promote and not
-   the next.
-2. **Tag mismatch.** The prod host pulls the **`:preview`** image
-   (`plane_image_tag` module default = `preview`; prod doesn't override),
-   but `deploy-prod` is oriented around `:master`.
+- `gh-actions-zebaria-plane` — build + `deploy-dev`. Trusts every ref
+  in this repo, so it has **no prod access** (SSM in us-east-1 only).
+- `gh-actions-zebaria-plane-prod-deploy` — `deploy-prod` only. Trust is
+  pinned to `refs/heads/master`, so no other branch, tag, or PR
+  workflow can run commands on prod.
 
-**To fix properly (TODO):** decouple `deploy-prod` from the branch-push
-event (trigger off a successful `:master` build via `needs`/`workflow_run`,
-not `github.ref`), and align the tag the prod host pulls with what the
-pipeline builds.
+**Image tag:** both hosts pull **`:preview`** (`plane_image_tag` module
+default; prod doesn't override). That's correct for prod because
+`promote --merge` leaves `preview` and `master` on the same commit, so
+`:preview` and `:master` are built from identical code.
 
-## Deploying prod manually (current reliable path)
-
-Safe — pull + restart only, no config rewrite. Works because `:preview`
-is rebuilt on every promote and prod pulls `:preview`.
-
-```bash
-PID=$(aws ec2 describe-instances --region us-west-2 \
-  --filters "Name=tag:Module,Values=plane" \
-            "Name=tag:Environment,Values=prod" \
-            "Name=instance-state-name,Values=running" \
-  --query 'Reservations[].Instances[].InstanceId' --output text)
-
-aws ssm send-command --region us-west-2 --instance-ids "$PID" \
-  --document-name AWS-RunShellScript \
-  --parameters '{"commands":[
-    "/opt/plane/ecr-login.sh",
-    "docker compose -f /opt/plane/docker-compose.yml pull",
-    "systemctl restart plane.service",
-    "systemctl is-active plane.service",
-    "docker compose -f /opt/plane/docker-compose.yml ps"
-  ]}'
-```
-
-(Or, from corpinfra, `terraform/modules/plane/scripts/deploy-config.sh
-prod` — that ALSO rewrites host config from the module, use it when
-compose/env changed, not just for a new image.)
+**We do not deploy by hand.** Prod is deployed only by `promote --merge`
+→ `deploy-prod`. If `deploy-prod` fails, read its log, fix the cause
+(workflow or IAM), and re-run the failed job from the Actions tab. When
+a change needs new host config (compose/env), that goes through
+corpinfra (`deploy-config.sh`), not an ad-hoc command on the host.
 
 ## PR review notes
 
